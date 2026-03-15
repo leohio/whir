@@ -98,7 +98,10 @@ where
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash, Default, Serialize, Deserialize)]
 #[must_use]
-pub struct Witness<F: FftField, G: Field> {
+pub struct Witness<F: FftField, G = F>
+where
+    G: Field,
+{
     pub matrix: Vec<F>,
     pub matrix_witness: matrix_commit::Witness,
     pub out_of_domain: Evaluations<G>,

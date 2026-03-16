@@ -1,6 +1,7 @@
 //! Protocol for grinding and verifying proof of work.
 
 use core::slice;
+use std::u64;
 
 use ark_std::rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,13 @@ pub fn difficulty(threshold: u64) -> Bits {
 }
 
 impl Config {
+    pub fn none() -> Self {
+        Self {
+            hash_id: BLAKE3,
+            threshold: u64::MAX,
+        }
+    }
+
     /// Creates a new configuration from a difficulty.
     ///
     /// Defaults to Blake3 as the hash function.
@@ -186,9 +194,49 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use proptest::proptest;
+    use std::u64;
+
+    use proptest::{proptest, strategy::Strategy};
+    #[cfg(feature = "tracing")]
+    use tracing::instrument;
 
     use super::*;
+    use crate::{
+        hash::tests::hash_for_size,
+        transcript::{codecs::Empty, DomainSeparator},
+    };
+
+    impl Config {
+        pub fn arbitrary() -> impl Strategy<Value = Config> {
+            (hash_for_size(64), (u64::MAX >> 6)..)
+                .prop_map(|(hash_id, threshold)| Config { hash_id, threshold })
+        }
+    }
+
+    #[cfg_attr(feature = "tracing", instrument)]
+    fn test_config(config: &Config) {
+        let ds = DomainSeparator::protocol(&config)
+            .session(&format!("Test at {}:{}", file!(), line!()))
+            .instance(&Empty);
+
+        // Prover
+        let mut prover_state = ProverState::new_std(&ds);
+        config.prove(&mut prover_state);
+        let proof = prover_state.proof();
+
+        // Verifier
+        let mut verifier_state = VerifierState::new_std(&ds, &proof);
+        config.verify(&mut verifier_state).unwrap();
+        verifier_state.check_eof().unwrap();
+    }
+
+    #[test]
+    fn test_pow() {
+        crate::tests::init();
+        proptest!(|(config in Config::arbitrary())| {
+            test_config(&config);
+        });
+    }
 
     #[test]
     fn test_threshold_integer() {

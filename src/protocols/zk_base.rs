@@ -20,6 +20,7 @@ use crate::{
     verify,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config<F: FftField> {
     pub commit: irs_commit::Config<Identity<F>>,
     pub sumcheck: sumcheck::Config<F>,

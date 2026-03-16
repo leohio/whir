@@ -609,7 +609,7 @@ pub(crate) fn num_in_domain_queries(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use ark_std::rand::{
         distributions::Standard, prelude::Distribution, rngs::StdRng, Rng, SeedableRng,
     };

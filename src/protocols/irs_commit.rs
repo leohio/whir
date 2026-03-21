@@ -653,16 +653,16 @@ pub(crate) mod tests {
         ) -> impl Strategy<Value = Config<M>> {
             assert!(interleaving_depth != 0);
             assert!(vector_size.is_multiple_of(interleaving_depth));
-            let message_length = vector_size / interleaving_depth;
+            let message_length = vector_size / interleaving_depth + mask_length;
 
             // Compute supported NTT domains for F
             let engine = NTT.get::<M::Source>().expect("Unsupported field");
-            let valid_codeword_lengths = iter::successors(engine.next_order(vector_size), |size| {
-                engine.next_order(*size + 1)
-            })
-            .take(4)
-            .collect::<Vec<_>>();
-            dbg!(message_length, &valid_codeword_lengths);
+            let valid_codeword_lengths =
+                iter::successors(engine.next_order(message_length), |size| {
+                    engine.next_order(*size + 1)
+                })
+                .take(4)
+                .collect::<Vec<_>>();
             let codeword_length = select(valid_codeword_lengths);
 
             // Combine with a matrix commitment config

@@ -5,12 +5,15 @@
 //! <https://eprint.iacr.org/2026/391.pdf> § 7.
 
 use ark_ff::FftField;
-use ark_std::rand::{distributions::Standard, prelude::Distribution, CryptoRng, Rng, RngCore};
+use ark_std::rand::{distributions::Standard, prelude::Distribution, CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use spongefish::{Decoding, VerificationResult};
 
 use crate::{
-    algebra::{dot, embedding::Identity, linear_form::Evaluate, multilinear_extend},
+    algebra::{
+        dot, embedding::Identity, multilinear_extend, random_vector, scalar_mul_add_new,
+        univariate_evaluate,
+    },
     hash::Hash,
     protocols::{irs_commit, sumcheck},
     transcript::{
@@ -57,9 +60,7 @@ impl<F: FftField> Config<F> {
         }
 
         // Create masking vector.
-        let mask = (0..vector.len())
-            .map(|_| prover_state.rng().gen())
-            .collect::<Vec<F>>();
+        let mask = random_vector(prover_state.rng(), vector.len());
 
         // Commit to the masking vector.
         let mask_witness = self.commit.commit(prover_state, &[&mask]);
@@ -70,17 +71,12 @@ impl<F: FftField> Config<F> {
 
         // RLC the mask with the vector
         let mask_rlc = prover_state.verifier_message::<F>();
-        let mut masked_vector = zip_strict(vector.iter(), mask.iter())
-            .map(|(v, m)| *v + mask_rlc * *m)
-            .collect::<Vec<F>>();
-
-        // Send masked vector in full.
-        for v in masked_vector.iter() {
-            prover_state.prover_message(v);
-        }
+        let mut masked_vector = scalar_mul_add_new(&vector, mask_rlc, &mask);
+        prover_state.prover_messages(&masked_vector);
 
         // Send combined IRS randomness. (r^* in paper)
-        // TODO: Implement IRS randomness.
+        let masked_masks = scalar_mul_add_new(&witness.masks, mask_rlc, &mask_witness.masks);
+        prover_state.prover_messages(&masked_masks);
 
         // Open the commitment and mask simultaneously.
         let _ = self.commit.open(prover_state, &[witness, &mask_witness]);
@@ -121,12 +117,11 @@ impl<F: FftField> Config<F> {
         if self.size() == 0 {
             return Ok((Vec::new(), F::ZERO));
         }
-
         let mask_commitment = self.commit.receive_commitment(verifier_state)?;
         let mask_sum: F = verifier_state.prover_message()?;
         let mask_rlc: F = verifier_state.verifier_message();
         let masked_vector: Vec<F> = verifier_state.prover_messages_vec(self.commit.vector_size)?;
-        // TODO: Implement IRS randomness.
+        let masked_masks: Vec<F> = verifier_state.prover_messages_vec(self.commit.mask_length)?;
 
         // Open the commitment and mask simultaneously.
         let evals = self
@@ -134,11 +129,12 @@ impl<F: FftField> Config<F> {
             .verify(verifier_state, &[commitment, &mask_commitment])?;
 
         // Spot check evaluations.
-        for (point, value) in zip_strict(
-            evals.evaluators(self.commit.vector_size),
-            evals.values(&[F::ONE, mask_rlc]),
-        ) {
-            verify!(point.evaluate(&Identity::new(), &masked_vector) == value);
+        for (&point, value) in zip_strict(&evals.points, evals.values(&[F::ONE, mask_rlc])) {
+            // We expected `f(x) + x^l · g(x)` where l = deg(f) + 1, f is the message and g the mask.
+            let expected = univariate_evaluate(&masked_vector, point)
+                + point.pow([self.commit.message_length() as u64])
+                    * univariate_evaluate(&masked_masks, point);
+            verify!(value == expected);
         }
 
         // Sumcheck on masked inner product
@@ -240,7 +236,7 @@ mod tests {
     {
         crate::tests::init();
         let configs = (0_usize..1 << 10, 0_usize..1 << 10)
-            .prop_flat_map(|(size, mask_lenngth)| Config::arbitrary(size, mask_lenngth));
+            .prop_flat_map(|(size, mask_length)| Config::arbitrary(size, mask_length));
         proptest!(|(seed: u64, config in configs)| {
             test_config(seed, &config);
         });

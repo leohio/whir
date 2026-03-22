@@ -72,8 +72,10 @@ pub trait ReedSolomon<F>: Debug + Send + Sync {
 
     /// Returns the `indext`th evaluation point for a `order` sized codeword.
     ///
-    /// Returns `None` if the `order` is not supported or `index ≥ order`.
-    fn evaluation_point(&self, order: usize, index: usize) -> Option<F>;
+    /// # Panics
+    ///
+    /// Panics if any of the indices are `>= order` or `order` is not supported.
+    fn evaluation_points(&self, order: usize, indices: &[usize]) -> Vec<F>;
 
     /// Compute a masked interleaved Reed-Solomon encoding.
     ///
@@ -96,10 +98,10 @@ pub fn next_order<F: 'static>(size: usize) -> Option<usize> {
         .next_order(size)
 }
 
-pub fn evaluation_point<F: 'static>(order: usize, index: usize) -> Option<F> {
+pub fn evaluation_points<F: 'static>(order: usize, indices: &[usize]) -> Vec<F> {
     NTT.get::<F>()
         .expect("Unsupported NTT field.")
-        .evaluation_point(order, index)
+        .evaluation_points(order, indices)
 }
 
 pub fn interleaved_rs_encode<F: 'static>(
@@ -178,10 +180,8 @@ mod tests {
             assert_eq!(codeword.len(), codeword_length * num_messages);
 
             // Output values are polynomial evaluations in the evaluation points.
-            let mut evaluation_points = Vec::new();
-            for &index in &sampled_indices {
-                let evaluation_point = ntt.evaluation_point(codeword_length, index).unwrap();
-                evaluation_points.push(evaluation_point);
+            let mut evaluation_points = ntt.evaluation_points(codeword_length, &sampled_indices);
+            for (&index, &evaluation_point) in zip_strict(&sampled_indices, &evaluation_points) {
                 let evaluations = &codeword[index * num_messages.. (index + 1) * num_messages];
                 let masks = chunks_exact_or_empty(&masks, mask_length, num_messages);
                 for ((message, mask), value) in zip_strict(zip_strict(&messages, masks), evaluations) {

@@ -177,8 +177,7 @@ impl<F: FftField> Config<F> {
     pub(crate) fn omega_full(&self) -> F {
         let codeword_length = self.blinded_commitment.initial_committer.codeword_length;
         let full_domain_size = codeword_length * self.interleaving_depth();
-        crate::algebra::ntt::evaluation_point(full_domain_size, 1)
-            .expect("full IRS domain should have primitive root")
+        crate::algebra::ntt::evaluation_points(full_domain_size, &[1])[0]
     }
 
     /// Sub-domain generator (ω_sub = ω^interleaving_depth).
@@ -187,7 +186,7 @@ impl<F: FftField> Config<F> {
         // Assume it has a generator, and the evaluation order is 1, g, g^2, ...
         self.blinded_commitment
             .initial_committer
-            .evaluation_point(1)
+            .evaluation_points(&[1])[0]
     }
 
     /// ζ = ω^num_rows — the interleaving_depth-th root of unity.

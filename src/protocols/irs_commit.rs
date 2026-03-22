@@ -236,8 +236,8 @@ where
         self.message_length() + self.mask_length
     }
 
-    pub fn evaluation_point(&self, index: usize) -> M::Source {
-        ntt::evaluation_point::<M::Source>(self.codeword_length, index).unwrap()
+    pub fn evaluation_points(&self, indices: &[usize]) -> Vec<M::Source> {
+        ntt::evaluation_points::<M::Source>(self.codeword_length, indices)
     }
 
     pub fn rate(&self) -> f64 {
@@ -503,13 +503,7 @@ where
             self.in_domain_samples,
             self.deduplicate_in_domain,
         );
-
-        // Compute corresponding in-domain evaluation points
-        let points = indices
-            .iter()
-            .map(|index| self.evaluation_point(*index))
-            .collect::<Vec<_>>();
-
+        let points = self.evaluation_points(&indices);
         (indices, points)
     }
 }
@@ -807,7 +801,7 @@ pub(crate) mod tests {
         Standard: Distribution<M::Source> + Distribution<M::Target>,
     {
         let valid_sizes = (1..=1024)
-            .filter(|&n| ntt::evaluation_point::<M::Source>(n, 1).is_some())
+            .filter(|&n| ntt::next_order::<M::Source>(n) == Some(n))
             .collect::<Vec<_>>();
         let size = select(valid_sizes);
 

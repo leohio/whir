@@ -349,12 +349,16 @@ impl<F: FftField> ReedSolomon<F> for NttEngine<F> {
         }
     }
 
-    fn evaluation_point(&self, order: usize, index: usize) -> Option<F> {
-        if index >= order || !self.order.is_multiple_of(order) {
-            return None;
+    fn evaluation_points(&self, order: usize, indices: &[usize]) -> Vec<F> {
+        assert!(self.order.is_multiple_of(order));
+        let mut result = Vec::new();
+        let roots = self.roots_table(order);
+        assert!(roots.len().is_multiple_of(order));
+        let step = roots.len() / order;
+        for index in indices {
+            result.push(roots[index * step % roots.len()])
         }
-        let exponent = ((self.order / order) * index) % self.order;
-        Some(self.omega_order.pow([exponent as u64]))
+        result
     }
 
     fn interleaved_encode(&self, messages: &[&[F]], masks: &[F], codeword_length: usize) -> Vec<F> {
@@ -403,6 +407,7 @@ impl<F: FftField> ReedSolomon<F> for NttEngine<F> {
                 result.resize(result.len() + coset_padding, F::ZERO);
             }
         }
+        assert_eq!(result.len(), num_messages * codeword_length);
 
         // NTT each coset block, then transpose each codeword block from
         // coset-major `(num_cosets × coset_size)` layout into standard codeword

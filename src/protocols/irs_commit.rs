@@ -237,7 +237,11 @@ where
     }
 
     pub fn evaluation_points(&self, indices: &[usize]) -> Vec<M::Source> {
-        ntt::evaluation_points::<M::Source>(self.codeword_length, indices)
+        ntt::evaluation_points::<M::Source>(
+            self.masked_message_length(),
+            self.codeword_length,
+            indices,
+        )
     }
 
     pub fn rate(&self) -> f64 {

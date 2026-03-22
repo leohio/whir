@@ -14,7 +14,10 @@ use super::{
     utils::{lcm, sqrt_factor},
     ReedSolomon,
 };
-use crate::utils::{chunks_exact_or_empty, zip_strict};
+use crate::{
+    algebra::ntt::transpose::transpose_permute,
+    utils::{chunks_exact_or_empty, zip_strict},
+};
 
 /// Enginge for computing NTTs over arbitrary fields.
 /// Assumes the field has large two-adicity.
@@ -349,13 +352,31 @@ impl<F: FftField> ReedSolomon<F> for NttEngine<F> {
         }
     }
 
-    fn evaluation_points(&self, order: usize, indices: &[usize]) -> Vec<F> {
-        assert!(self.order.is_multiple_of(order));
+    fn evaluation_points(
+        &self,
+        masked_message_length: usize,
+        codeword_length: usize,
+        indices: &[usize],
+    ) -> Vec<F> {
+        assert!(masked_message_length <= codeword_length);
+        assert!(self.order.is_multiple_of(codeword_length));
         let mut result = Vec::new();
-        let roots = self.roots_table(order);
-        assert!(roots.len().is_multiple_of(order));
-        let step = roots.len() / order;
-        for index in indices {
+        let roots = self.roots_table(codeword_length);
+        assert!(roots.len().is_multiple_of(codeword_length));
+        let step = roots.len() / codeword_length;
+
+        // Coset transformation
+        let mut coset_size = self.next_order(masked_message_length).unwrap();
+        while !codeword_length.is_multiple_of(coset_size) {
+            coset_size = self.next_order(coset_size + 1).unwrap();
+        }
+        let num_cosets = codeword_length / coset_size;
+
+        for &index in indices {
+            assert!(index < codeword_length);
+
+            #[cfg(not(feature = "rs_in_order"))]
+            let index = transpose_permute(index, num_cosets, coset_size);
             result.push(roots[index * step % roots.len()])
         }
         result
@@ -420,6 +441,8 @@ impl<F: FftField> ReedSolomon<F> for NttEngine<F> {
             coset_size,
         );
         self.ntt_batch(&mut result, coset_size);
+
+        #[cfg(feature = "rs_in_order")]
         transpose(&mut result, num_cosets, coset_size);
 
         // Transpose to row-major order with vectors stacked horizontally.

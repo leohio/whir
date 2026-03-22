@@ -1,3 +1,4 @@
+#![cfg(feature = "rs_in_order")] // TODO: Support permuted.
 mod committer;
 mod prover;
 mod utils;
@@ -177,7 +178,7 @@ impl<F: FftField> Config<F> {
     pub(crate) fn omega_full(&self) -> F {
         let codeword_length = self.blinded_commitment.initial_committer.codeword_length;
         let full_domain_size = codeword_length * self.interleaving_depth();
-        crate::algebra::ntt::evaluation_points(full_domain_size, &[1])[0]
+        crate::algebra::ntt::evaluation_points(full_domain_size, full_domain_size, &[1])[0]
     }
 
     /// Sub-domain generator (ω_sub = ω^interleaving_depth).

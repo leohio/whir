@@ -6,6 +6,13 @@ use crate::utils::workload_size;
 // NOTE: The assumption that rows and cols are a power of two are actually only relevant for the square matrix case.
 // (This is because the algorithm recurses into 4 sub-matrices of half dimension; we assume those to be square matrices as well, which only works for powers of two).
 
+/// Compute the row-major index permutation for a transposition.
+pub fn transpose_permute(index: usize, rows: usize, cols: usize) -> usize {
+    debug_assert!(index < rows * cols);
+    let (row, col) = (index / cols, index % cols);
+    row + col * rows
+}
+
 /// Transposes a matrix in-place.
 ///
 /// This function processes a batch of matrices if the slice length is a multiple of `rows * cols`.

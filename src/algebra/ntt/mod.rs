@@ -70,7 +70,7 @@ pub trait ReedSolomon<F>: Debug + Send + Sync {
     /// Returns `None` if `size` exceeds the largest supported order.
     fn next_order(&self, size: usize) -> Option<usize>;
 
-    /// Returns the `indext`th evaluation point.
+    /// Returns the `index`th evaluation point.
     ///
     /// `masked_message_length`: the total message length including any mask values.
     ///

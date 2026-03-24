@@ -1,6 +1,6 @@
 //! Interleaved Reed-Solomon Commitment Protocol
 //!
-//! Commits to a `num_vectorss` by `vector_size` matrix over `F`.
+//! Commits to a `num_vectors` by `vector_size` matrix over `F`.
 //!
 //! This will be reshaped into a `vector_size / interleaving_depth` by
 //! `num_vectors * interleaving_depth` matrix. Then each row is encoded
@@ -328,7 +328,7 @@ where
         // Generate random mask
         let masks = random_vector(prover_state.rng(), self.mask_length * self.num_messages());
 
-        // Interleaved RS Encode the vectorss
+        // Interleaved RS Encode the vectors
         let messages = vectors
             .iter()
             .flat_map(|v| chunks_exact_or_empty(v, self.message_length(), self.interleaving_depth))

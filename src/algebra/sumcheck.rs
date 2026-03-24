@@ -64,7 +64,7 @@ pub fn compute_sumcheck_polynomial<F: Field>(a: &[F], b: &[F]) -> (F, F) {
 
 /// Folds evaluations by linear interpolation at the given weight, in place.
 ///
-/// The `values` are implictly zero-padded to the next power of two. On return,
+/// The `values` are implicitly zero-padded to the next power of two. On return,
 /// the length of `values` will always be a power of two.
 pub fn fold<F: Field>(values: &mut Vec<F>, weight: F) {
     fn recurse_both<F: Field>(low: &mut [F], high: &[F], weight: F) {

@@ -24,7 +24,7 @@ use crate::{
 // Supported primes
 const PRIMES: [usize; 2] = [2, 3];
 
-/// Enginge for computing NTTs over arbitrary fields.
+/// Engine for computing NTTs over arbitrary fields.
 /// Assumes the field has large two-adicity.
 #[derive(Debug)]
 pub struct NttEngine<F: Field> {
@@ -137,7 +137,7 @@ impl<F: Field> NttEngine<F> {
         self.ntt_dispatch(values, &roots, size);
     }
 
-    /// Inverse NTT. Does not aply 1/n scaling factor.
+    /// Inverse NTT. Does not apply 1/n scaling factor.
     pub fn intt(&self, values: &mut [F]) {
         if values.len() <= 1 {
             return;
@@ -146,7 +146,7 @@ impl<F: Field> NttEngine<F> {
         self.ntt(values);
     }
 
-    /// Inverse batch NTT. Does not aply 1/n scaling factor.
+    /// Inverse batch NTT. Does not apply 1/n scaling factor.
     pub fn intt_batch(&self, values: &mut [F], size: usize) {
         assert!(values.len().is_multiple_of(size));
         if size <= 1 {

@@ -60,7 +60,7 @@ impl<F: FftField> Config<F> {
         assert_eq!(self.commit.interleaving_depth, 1);
         assert_eq!(self.commit.num_vectors, 1);
         assert_eq!(self.commit.vector_size, self.sumcheck.initial_size);
-        assert_eq!(self.sumcheck.final_size(), 1);
+        assert_eq!(self.sumcheck.final_size(), 1.min(self.commit.vector_size));
         debug_assert_eq!(dot(&vector, &covector), sum);
         if self.size() == 0 {
             return (Vec::new(), F::ZERO);
@@ -137,7 +137,7 @@ impl<F: FftField> Config<F> {
         assert_eq!(self.commit.interleaving_depth, 1);
         assert_eq!(self.commit.num_vectors, 1);
         assert_eq!(self.commit.vector_size, self.sumcheck.initial_size);
-        assert_eq!(self.sumcheck.final_size(), 1);
+        assert_eq!(self.sumcheck.final_size(), 1.min(self.commit.vector_size));
         if self.size() == 0 {
             return Ok((Vec::new(), F::ZERO));
         }

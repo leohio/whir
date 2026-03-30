@@ -12,5 +12,6 @@ outputs/
 .envrc
 .direnv
 .flake
+CLAUDE.md
 rustc-ice-*.txt
 profile.json.gz

@@ -46,6 +46,7 @@ where
         indices.sort_unstable();
         indices.dedup();
     }
+
     indices
 }
 

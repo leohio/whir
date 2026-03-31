@@ -227,15 +227,19 @@ library SpongefishWhirVerify {
         // Open previous commitment with Merkle verification
         uint256 openCL;
         uint256 openMD;
-        uint256 openNumCols;
+        uint256 openRowBytes;
         if (round == 0) {
             openCL = params.initialCodewordLength;
             openMD = params.initialMerkleDepth;
-            openNumCols = params.initialInterleavingDepth * params.numVectors;
+            // Initial commitment: M::Source = Field64 (base field, 8 bytes each)
+            // num_cols = interleaving_depth * num_vectors
+            openRowBytes = params.initialInterleavingDepth * params.numVectors * 8;
         } else {
             openCL = params.roundCodewordLength;
             openMD = params.roundMerkleDepth;
-            openNumCols = params.roundInterleavingDepth;
+            // Round commitment: M::Source = Field64_3 (extension field, 24 bytes each)
+            // num_cols = interleaving_depth (in extension field elements)
+            openRowBytes = params.roundInterleavingDepth * 24;
         }
 
         // For round 0: opening the initial commitment → use initial in_domain_samples
@@ -254,7 +258,7 @@ library SpongefishWhirVerify {
         // Read rows and compute leaf hashes (in UNSORTED order matching hints)
         bytes32[] memory rawLeafHashes = new bytes32[](rawIndices.length);
         for (uint256 i = 0; i < rawIndices.length; i++) {
-            bytes memory rowData = SpongefishWhir.proverHint(ts, hints, openNumCols * 8);
+            bytes memory rowData = SpongefishWhir.proverHint(ts, hints, openRowBytes);
             rawLeafHashes[i] = keccak256(rowData);
         }
 
@@ -296,15 +300,17 @@ library SpongefishWhirVerify {
         // Final Merkle open
         uint256 finalCL;
         uint256 finalMD;
-        uint256 finalNumCols;
+        uint256 finalRowBytes;
         if (params.numRounds == 0) {
             finalCL = params.initialCodewordLength;
             finalMD = params.initialMerkleDepth;
-            finalNumCols = params.initialInterleavingDepth * params.numVectors;
+            // Initial: Field64 (8 bytes each)
+            finalRowBytes = params.initialInterleavingDepth * params.numVectors * 8;
         } else {
             finalCL = params.roundCodewordLength;
             finalMD = params.roundMerkleDepth;
-            finalNumCols = params.roundInterleavingDepth;
+            // Round: Field64_3 (24 bytes each)
+            finalRowBytes = params.roundInterleavingDepth * 24;
         }
 
         // For final open: use inDomainSamples if opening initial, roundInDomainSamples if opening round
@@ -317,7 +323,7 @@ library SpongefishWhirVerify {
         SpongefishWhir.proverHint(ts, hints, 8);
         bytes32[] memory rawFinalHashes = new bytes32[](rawFinalIndices.length);
         for (uint256 i = 0; i < rawFinalIndices.length; i++) {
-            bytes memory rowData = SpongefishWhir.proverHint(ts, hints, finalNumCols * 8);
+            bytes memory rowData = SpongefishWhir.proverHint(ts, hints, finalRowBytes);
             rawFinalHashes[i] = keccak256(rowData);
         }
 

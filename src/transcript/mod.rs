@@ -4,6 +4,7 @@
 //! would roughly double the verifier cost.
 
 pub mod codecs;
+mod keccak256_chain;
 mod mock_sponge;
 
 #[cfg(debug_assertions)]
@@ -13,8 +14,8 @@ use std::fmt::Debug;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::{rngs::StdRng, CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
-use sha3::{Digest, Sha3_256, Sha3_512};
-use spongefish::StdHash;
+use sha3::{Digest, Keccak256};
+pub use self::keccak256_chain::Keccak256Chain;
 pub use spongefish::{
     Codec, Decoding, DuplexSpongeInterface, Encoding, NargDeserialize, NargSerialize,
     VerificationError, VerificationResult,
@@ -69,7 +70,7 @@ pub struct Proof {
     pub pattern: Vec<Interaction>,
 }
 
-pub struct ProverState<H = StdHash, R = StdRng>
+pub struct ProverState<H = Keccak256Chain, R = StdRng>
 where
     H: DuplexSpongeInterface,
     R: RngCore + CryptoRng,
@@ -81,7 +82,7 @@ where
     pattern: Vec<Interaction>,
 }
 
-pub struct VerifierState<'a, H = StdHash>
+pub struct VerifierState<'a, H = Keccak256Chain>
 where
     H: DuplexSpongeInterface,
 {
@@ -110,9 +111,24 @@ pub trait VerifierMessage {
 impl DomainSeparator<'static, ()> {
     pub fn protocol<C: Serialize>(config: &C) -> Self {
         const INSTANCE: &() = &();
-        let mut hash = Sha3_512::new();
-        ciborium::into_writer(config, &mut hash).expect("Computing protocol hash failed");
-        let protocol_id: [u8; 64] = hash.finalize().into();
+        // Hash config twice to fill 64 bytes: first half = H(0x00 || config), second half = H(0x01 || config)
+        let mut config_bytes = Vec::new();
+        ciborium::into_writer(config, &mut config_bytes).expect("Computing protocol hash failed");
+        let first: [u8; 32] = {
+            let mut h = Keccak256::new();
+            h.update([0x00]);
+            h.update(&config_bytes);
+            h.finalize().into()
+        };
+        let second: [u8; 32] = {
+            let mut h = Keccak256::new();
+            h.update([0x01]);
+            h.update(&config_bytes);
+            h.finalize().into()
+        };
+        let mut protocol_id = [0u8; 64];
+        protocol_id[..32].copy_from_slice(&first);
+        protocol_id[32..].copy_from_slice(&second);
         Self {
             protocol_id,
             session_id: [0; 32],
@@ -122,8 +138,11 @@ impl DomainSeparator<'static, ()> {
 
     #[must_use]
     pub fn session<S: Serialize>(self, session: &S) -> Self {
-        let mut hash = Sha3_256::new();
-        ciborium::into_writer(session, &mut hash).expect("Computing session hash failed");
+        let mut hash = Keccak256::new();
+        let mut session_bytes = Vec::new();
+        ciborium::into_writer(session, &mut session_bytes)
+            .expect("Computing session hash failed");
+        hash.update(&session_bytes);
         let session_id: [u8; 32] = hash.finalize().into();
         Self { session_id, ..self }
     }
@@ -170,13 +189,13 @@ where
     }
 }
 
-impl ProverState<StdHash, StdRng> {
-    /// Construct a new prover state with the standard duplex hash function.
+impl ProverState<Keccak256Chain, StdRng> {
+    /// Construct a new prover state with the EVM-friendly keccak256 hash chain.
     pub fn new_std<I>(ds: &DomainSeparator<'_, I>) -> Self
     where
         I: Encoding<[u8]>,
     {
-        Self::new(ds, StdHash::default())
+        Self::new(ds, Keccak256Chain::default())
     }
 }
 
@@ -350,13 +369,13 @@ where
     }
 }
 
-impl<'a> VerifierState<'a, StdHash> {
-    /// Construct a new verifier state with the standard duplex hash function.
+impl<'a> VerifierState<'a, Keccak256Chain> {
+    /// Construct a new verifier state with the EVM-friendly keccak256 hash chain.
     pub fn new_std<'b, I>(ds: &DomainSeparator<'b, I>, proof: &'a Proof) -> Self
     where
         I: Encoding<[u8]>,
     {
-        Self::new(ds, proof, StdHash::default())
+        Self::new(ds, proof, Keccak256Chain::default())
     }
 }
 

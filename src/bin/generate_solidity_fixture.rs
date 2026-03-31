@@ -217,6 +217,25 @@ fn main() {
         "round_num_cosets": round_num_cosets,
     });
 
+    // ── Compute FinalClaim debug values ────────────────────────────────
+    let base_elems = |v: &Field64_3| -> Vec<u64> {
+        v.to_base_prime_field_elements()
+            .map(|e| e.into_bigint().0[0])
+            .collect()
+    };
+
+    let fc = {
+        let verify_lf_fc: Vec<Box<dyn LinearForm<Field64_3>>> =
+            vec![Box::new(MultilinearExtension { point: point.clone() })];
+        let mut vs_fc = VerifierState::new_std(&ds, &proof);
+        let comm_fc = config.receive_commitment(&mut vs_fc).unwrap();
+        let fc = config.verify(&mut vs_fc, &[&comm_fc], &evaluations).unwrap();
+        fc.verify(verify_lf_fc.iter().map(|l| l.as_ref() as &dyn LinearForm<_>)).unwrap();
+        fc
+    };
+
+    let fc_rlc = base_elems(&fc.linear_form_rlc);
+
     // ── Build JSON ──────────────────────────────────────────────────────
     let fixture = json!({
         "protocol_id": format!("0x{}", hex::encode(protocol_id)),
@@ -235,29 +254,11 @@ fn main() {
             "starting_log_inv_rate": whir_params.starting_log_inv_rate,
         },
         "whir_params": whir_params_json,
+        "debug": {
+            "linear_form_rlc": { "c0": fc_rlc[0], "c1": fc_rlc[1], "c2": fc_rlc[2] },
+            "note": "Run with DUMP_FC=1 to see intermediate values on stderr",
+        },
     });
 
     println!("{}", serde_json::to_string_pretty(&fixture).unwrap());
-
-    // Compute FinalClaim and add debug values to fixture (on stderr)
-    {
-        let verify_lf3: Vec<Box<dyn LinearForm<Field64_3>>> =
-            vec![Box::new(MultilinearExtension { point: point.clone() })];
-        let mut vs2 = VerifierState::new_std(&ds, &proof);
-        let commitment2 = config.receive_commitment(&mut vs2).unwrap();
-        let fc = config.verify(&mut vs2, &[&commitment2], &evaluations).unwrap();
-
-        let base_elems = |v: &Field64_3| -> Vec<u64> {
-            v.to_base_prime_field_elements()
-                .map(|e| e.into_bigint().0[0])
-                .collect()
-        };
-
-        // Write debug values to stderr for fixture reference
-        eprintln!("FinalClaim linear_form_rlc: {:?}", base_elems(&fc.linear_form_rlc));
-        eprintln!("FinalClaim rlc_coefficients[0]: {:?}", base_elems(&fc.rlc_coefficients[0]));
-        for (i, r) in fc.evaluation_point.iter().enumerate() {
-            eprintln!("  eval_point[{}]: {:?}", i, base_elems(r));
-        }
-    }
 }

@@ -226,88 +226,18 @@ library SpongefishWhirVerify {
         // Receive new commitment
         bytes32 roundRoot = SpongefishWhir.proverMessageHash(ts, transcript);
 
-        // OOD for this round
+        // OOD for this round (need to store both points and answers for constraint values)
         GoldilocksExt3.Ext3[] memory roundOodPoints = new GoldilocksExt3.Ext3[](params.roundOutDomainSamples);
+        GoldilocksExt3.Ext3[] memory roundOodAnswers = new GoldilocksExt3.Ext3[](params.roundOutDomainSamples);
         for (uint256 i = 0; i < params.roundOutDomainSamples; i++) {
             (uint64 c0, uint64 c1, uint64 c2) = SpongefishWhir.verifierMessageField64x3(ts);
             roundOodPoints[i] = GoldilocksExt3.Ext3(c0, c1, c2);
-            SpongefishWhir.proverMessageField64x3(ts, transcript); // read OOD value (absorbed, not stored)
+            (uint64 a0, uint64 a1, uint64 a2) = SpongefishWhir.proverMessageField64x3(ts, transcript);
+            roundOodAnswers[i] = GoldilocksExt3.Ext3(a0, a1, a2);
         }
 
         // Open previous commitment with Merkle verification
-        uint256 openCL;
-        uint256 openMD;
-        uint256 openRowBytes;
-        uint64 openDomainGen;
-        uint256 openNumCosets;
-        uint256 openCosetSize;
-        if (round == 0) {
-            openCL = params.initialCodewordLength;
-            openMD = params.initialMerkleDepth;
-            openRowBytes = params.initialInterleavingDepth * params.numVectors * 8;
-            openDomainGen = params.initialDomainGenerator;
-            openNumCosets = params.initialNumCosets;
-            openCosetSize = params.initialCosetSize;
-        } else {
-            openCL = params.roundCodewordLength;
-            openMD = params.roundMerkleDepth;
-            openRowBytes = params.roundInterleavingDepth * 24;
-            openDomainGen = params.roundDomainGenerator;
-            openNumCosets = params.roundNumCosets;
-            openCosetSize = params.roundCosetSize;
-        }
-
-        uint256 openInDomainSamples = (round == 0)
-            ? params.inDomainSamples
-            : params.roundInDomainSamples;
-
-        uint256[] memory rawIndices = _challengeIndicesUnsorted(ts, openCL, openInDomainSamples);
-
-        // Read rows + Merkle verify
-        SpongefishWhir.proverHint(ts, hints, 8);
-        bytes32[] memory rawLeafHashes = new bytes32[](rawIndices.length);
-        for (uint256 i = 0; i < rawIndices.length; i++) {
-            bytes memory rowData = SpongefishWhir.proverHint(ts, hints, openRowBytes);
-            rawLeafHashes[i] = keccak256(rowData);
-        }
-
-        (uint256[] memory sortedIndices, bytes32[] memory sortedHashes) =
-            _sortAndDedupWithHashes(rawIndices, rawLeafHashes);
-
-        ts.hintPos = SpongefishMerkle.verify(
-            vs.prevRoot, openMD, sortedIndices, sortedHashes, hints, ts.hintPos
-        );
-
-        // Constraint RLC for this round
-        uint256 constraintCount = params.roundOutDomainSamples + rawIndices.length;
-        GoldilocksExt3.Ext3[] memory roundRlc = SpongefishWhir.geometricChallenge(ts, constraintCount);
-
-        // Build evaluation points: OOD points ++ in-domain points
-        // In-domain points are domain elements: g^(transpose_permute(index))
-        GoldilocksExt3.Ext3[] memory allEvalPoints = new GoldilocksExt3.Ext3[](constraintCount);
-        for (uint256 i = 0; i < params.roundOutDomainSamples; i++) {
-            allEvalPoints[i] = roundOodPoints[i];
-        }
-        for (uint256 i = 0; i < rawIndices.length; i++) {
-            // transpose_permute(index, num_cosets, coset_size)
-            uint256 idx = rawIndices[i];
-            uint256 row = idx / openCosetSize;
-            uint256 col = idx % openCosetSize;
-            uint256 permuted = row + col * openNumCosets;
-            // g^permuted mod GL_P
-            uint64 domainPt = _glPow(openDomainGen, permuted);
-            allEvalPoints[params.roundOutDomainSamples + i] = GoldilocksExt3.fromBase(domainPt);
-        }
-
-        // Store round constraint (entry 1 + round)
-        // In the Rust subtraction loop: round_constraints[1+round] uses
-        // round_configs[round].initial_num_variables() for ALL intermediate rounds
-        uint256 numVars = params.roundInitialNumVariables;
-        vs.roundConstraints[1 + round] = RoundConstraintEntry({
-            rlcCoeffs: roundRlc,
-            univariatePoints: allEvalPoints,
-            numVariables: numVars
-        });
+        _openAndVerifyCommitment(ts, hints, params, vs, round, roundOodAnswers, roundOodPoints);
 
         // Sumcheck
         _phaseSumcheck(ts, transcript, params.roundSumcheckRounds, vs);
@@ -506,6 +436,177 @@ library SpongefishWhirVerify {
             b = mulmod(b, b, p);
         }
         return uint64(result);
+    }
+
+    struct OpenParams {
+        uint256 cl;
+        uint256 md;
+        uint256 rowBytes;
+        uint64 domainGen;
+        uint256 numCosets;
+        uint256 cosetSize;
+        uint256 inDomainSamples;
+        uint256 numCols;
+        bool isBaseField;
+    }
+
+    function _getOpenParams(WhirParams memory params, uint256 round) private pure returns (OpenParams memory o) {
+        if (round == 0) {
+            o.cl = params.initialCodewordLength;
+            o.md = params.initialMerkleDepth;
+            o.rowBytes = params.initialInterleavingDepth * params.numVectors * 8;
+            o.domainGen = params.initialDomainGenerator;
+            o.numCosets = params.initialNumCosets;
+            o.cosetSize = params.initialCosetSize;
+            o.inDomainSamples = params.inDomainSamples;
+            o.numCols = params.initialInterleavingDepth * params.numVectors;
+            o.isBaseField = true;
+        } else {
+            o.cl = params.roundCodewordLength;
+            o.md = params.roundMerkleDepth;
+            o.rowBytes = params.roundInterleavingDepth * 24;
+            o.domainGen = params.roundDomainGenerator;
+            o.numCosets = params.roundNumCosets;
+            o.cosetSize = params.roundCosetSize;
+            o.inDomainSamples = params.roundInDomainSamples;
+            o.numCols = params.roundInterleavingDepth;
+            o.isBaseField = false;
+        }
+    }
+
+    function _openAndVerifyCommitment(
+        SpongefishWhir.TranscriptState memory ts,
+        bytes memory hints,
+        WhirParams memory params,
+        VerifyState memory vs,
+        uint256 round,
+        GoldilocksExt3.Ext3[] memory roundOodAnswers,
+        GoldilocksExt3.Ext3[] memory roundOodPoints
+    ) private pure {
+        OpenParams memory o = _getOpenParams(params, round);
+
+        uint256[] memory rawIndices = _challengeIndicesUnsorted(ts, o.cl, o.inDomainSamples);
+        uint256 rawCount = rawIndices.length;
+
+        SpongefishWhir.proverHint(ts, hints, 8);
+
+        bytes32[] memory rawLeafHashes = new bytes32[](rawCount);
+        GoldilocksExt3.Ext3[][] memory decodedRows = new GoldilocksExt3.Ext3[][](rawCount);
+
+        for (uint256 i = 0; i < rawCount; i++) {
+            bytes memory rowData = SpongefishWhir.proverHint(ts, hints, o.rowBytes);
+            rawLeafHashes[i] = keccak256(rowData);
+            decodedRows[i] = _decodeRow(rowData, o.numCols, o.isBaseField);
+        }
+
+        GoldilocksExt3.Ext3[] memory inDomainEvalPoints = _computeEvalPoints(
+            rawIndices, rawCount, o.domainGen, o.numCosets, o.cosetSize
+        );
+
+        (uint256[] memory sortedIndices, bytes32[] memory sortedHashes) =
+            _sortAndDedupWithHashes(rawIndices, rawLeafHashes);
+
+        ts.hintPos = SpongefishMerkle.verify(
+            vs.prevRoot, o.md, sortedIndices, sortedHashes, hints, ts.hintPos
+        );
+
+        _addConstraintValues(ts, params, vs, round, rawCount, roundOodAnswers,
+            roundOodPoints, decodedRows, inDomainEvalPoints);
+    }
+
+    function _decodeRow(
+        bytes memory rowData,
+        uint256 numCols,
+        bool isBaseField
+    ) private pure returns (GoldilocksExt3.Ext3[] memory cols) {
+        cols = new GoldilocksExt3.Ext3[](numCols);
+        if (isBaseField) {
+            for (uint256 j = 0; j < numCols; j++) {
+                cols[j] = GoldilocksExt3.fromBase(_readU64LE(rowData, j * 8));
+            }
+        } else {
+            for (uint256 j = 0; j < numCols; j++) {
+                cols[j] = GoldilocksExt3.Ext3(
+                    _readU64LE(rowData, j * 24),
+                    _readU64LE(rowData, j * 24 + 8),
+                    _readU64LE(rowData, j * 24 + 16)
+                );
+            }
+        }
+    }
+
+    function _computeEvalPoints(
+        uint256[] memory rawIndices,
+        uint256 rawCount,
+        uint64 domainGen,
+        uint256 numCosets,
+        uint256 cosetSize
+    ) private pure returns (GoldilocksExt3.Ext3[] memory pts) {
+        pts = new GoldilocksExt3.Ext3[](rawCount);
+        for (uint256 i = 0; i < rawCount; i++) {
+            uint256 idx = rawIndices[i];
+            uint256 row_ = idx / cosetSize;
+            uint256 col_ = idx % cosetSize;
+            uint256 permuted = row_ + col_ * numCosets;
+            pts[i] = GoldilocksExt3.fromBase(_glPow(domainGen, permuted));
+        }
+    }
+
+    function _addConstraintValues(
+        SpongefishWhir.TranscriptState memory ts,
+        WhirParams memory params,
+        VerifyState memory vs,
+        uint256 round,
+        uint256 rawCount,
+        GoldilocksExt3.Ext3[] memory roundOodAnswers,
+        GoldilocksExt3.Ext3[] memory roundOodPoints,
+        GoldilocksExt3.Ext3[][] memory decodedRows,
+        GoldilocksExt3.Ext3[] memory inDomainEvalPoints
+    ) private pure {
+        // eq_weights from last folding randomness
+        uint256 ff = (round == 0) ? params.initialSumcheckRounds : params.roundSumcheckRounds;
+        GoldilocksExt3.Ext3[] memory lastFoldR = new GoldilocksExt3.Ext3[](ff);
+        for (uint256 i = 0; i < ff; i++) {
+            lastFoldR[i] = vs.allFoldingRandomness[vs.foldIdx - ff + i];
+        }
+        GoldilocksExt3.Ext3[] memory eqW = WhirLinearAlgebra.eqWeights(lastFoldR);
+
+        // Constraint RLC
+        uint256 constraintCount = params.roundOutDomainSamples + rawCount;
+        GoldilocksExt3.Ext3[] memory roundRlc = SpongefishWhir.geometricChallenge(ts, constraintCount);
+
+        // Add OOD constraint values
+        for (uint256 i = 0; i < params.roundOutDomainSamples; i++) {
+            vs.theSum = vs.theSum.add(roundOodAnswers[i].mul(roundRlc[i]));
+        }
+
+        // Add in-domain constraint values
+        for (uint256 i = 0; i < rawCount; i++) {
+            GoldilocksExt3.Ext3 memory val = GoldilocksExt3.dot(eqW, decodedRows[i]);
+            vs.theSum = vs.theSum.add(val.mul(roundRlc[params.roundOutDomainSamples + i]));
+        }
+
+        // Build evaluation points for FinalClaim
+        GoldilocksExt3.Ext3[] memory allEvalPoints = new GoldilocksExt3.Ext3[](constraintCount);
+        for (uint256 i = 0; i < params.roundOutDomainSamples; i++) {
+            allEvalPoints[i] = roundOodPoints[i];
+        }
+        for (uint256 i = 0; i < rawCount; i++) {
+            allEvalPoints[params.roundOutDomainSamples + i] = inDomainEvalPoints[i];
+        }
+
+        vs.roundConstraints[1 + round] = RoundConstraintEntry({
+            rlcCoeffs: roundRlc,
+            univariatePoints: allEvalPoints,
+            numVariables: params.roundInitialNumVariables
+        });
+    }
+
+    /// @dev Read a uint64 in little-endian from a byte array at the given offset.
+    function _readU64LE(bytes memory data, uint256 offset) private pure returns (uint64 val) {
+        for (uint256 i = 0; i < 8; i++) {
+            val |= uint64(uint8(data[offset + i])) << uint64(i * 8);
+        }
     }
 
     function _ceilDiv(uint256 a, uint256 b) private pure returns (uint256) {

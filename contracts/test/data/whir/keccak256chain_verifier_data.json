@@ -1,4 +1,12 @@
 {
+  "debug": {
+    "linear_form_rlc": {
+      "c0": 8086646072245720096,
+      "c1": 7611059693684508304,
+      "c2": 3355734669383478410
+    },
+    "note": "Run with DUMP_FC=1 to see intermediate values on stderr"
+  },
   "evaluation_point": [
     "1",
     "2",

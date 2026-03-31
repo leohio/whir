@@ -51,6 +51,12 @@ library SpongefishWhirVerify {
     }
 
     /// @notice Intermediate state passed between verification phases.
+    struct RoundConstraint {
+        GoldilocksExt3.Ext3[] rlcCoeffs;       // geometric_challenge output
+        GoldilocksExt3.Ext3[] evalPoints;       // OOD + in-domain evaluation points
+        uint256 numVariables;                    // num variables for this round's eval_point slice
+    }
+
     struct VerifyState {
         GoldilocksExt3.Ext3 theSum;
         GoldilocksExt3.Ext3[] allFoldingRandomness;
@@ -62,6 +68,8 @@ library SpongefishWhirVerify {
         GoldilocksExt3.Ext3[] initialOodRlcCoeffs;
         GoldilocksExt3.Ext3[] initialConstraintRlc;
         uint256 numLinearForms;
+        // All round constraints (for FinalClaim subtraction)
+        RoundConstraint[] roundConstraints;
     }
 
     /// @notice Verify a WHIR polynomial commitment proof.
@@ -398,7 +406,10 @@ library SpongefishWhirVerify {
             );
             // linearFormRlc -= rlcCoeffs[i] * mleVal
             GoldilocksExt3.Ext3 memory term = mleVal.mul(rlcCoeffs[i]);
-            linearFormRlc = linearFormRlc.sub(term);
+            GoldilocksExt3.Ext3 memory result = linearFormRlc.sub(term);
+            linearFormRlc.c0 = result.c0;
+            linearFormRlc.c1 = result.c1;
+            linearFormRlc.c2 = result.c2;
         }
     }
 

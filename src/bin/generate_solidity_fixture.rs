@@ -166,6 +166,24 @@ fn main() {
         config.round_configs.last().unwrap().irs_committer.codeword_length
     };
 
+    // Coset parameters for evaluation point computation
+    let initial_mml = config.initial_committer.masked_message_length();
+    let initial_coset_size = {
+        let mut cs = initial_mml.next_power_of_two(); // simplified: power of 2
+        while initial_cl % cs != 0 { cs *= 2; }
+        cs
+    };
+    let initial_num_cosets = initial_cl / initial_coset_size;
+
+    let (round_mml, round_coset_size, round_num_cosets) = if let Some(rc) = config.round_configs.first() {
+        let mml = rc.irs_committer.masked_message_length();
+        let mut cs = mml.next_power_of_two();
+        while round_cl % cs != 0 { cs *= 2; }
+        (mml, cs, round_cl / cs)
+    } else {
+        (0, 0, 0)
+    };
+
     let whir_params_json = json!({
         "num_variables": num_variables,
         "folding_factor": whir_params.folding_factor,
@@ -189,6 +207,14 @@ fn main() {
         "final_domain_generator": gl_root(final_cl),
         "initial_interleaving_depth": initial_id,
         "round_interleaving_depth": round_id,
+        // New params for FinalClaim
+        "initial_num_variables": config.initial_num_variables(),
+        "round_initial_num_variables": config.round_configs.first()
+            .map(|rc| rc.initial_num_variables()).unwrap_or(0),
+        "initial_coset_size": initial_coset_size,
+        "initial_num_cosets": initial_num_cosets,
+        "round_coset_size": round_coset_size,
+        "round_num_cosets": round_num_cosets,
     });
 
     // ── Build JSON ──────────────────────────────────────────────────────
@@ -212,4 +238,26 @@ fn main() {
     });
 
     println!("{}", serde_json::to_string_pretty(&fixture).unwrap());
+
+    // Compute FinalClaim and add debug values to fixture (on stderr)
+    {
+        let verify_lf3: Vec<Box<dyn LinearForm<Field64_3>>> =
+            vec![Box::new(MultilinearExtension { point: point.clone() })];
+        let mut vs2 = VerifierState::new_std(&ds, &proof);
+        let commitment2 = config.receive_commitment(&mut vs2).unwrap();
+        let fc = config.verify(&mut vs2, &[&commitment2], &evaluations).unwrap();
+
+        let base_elems = |v: &Field64_3| -> Vec<u64> {
+            v.to_base_prime_field_elements()
+                .map(|e| e.into_bigint().0[0])
+                .collect()
+        };
+
+        // Write debug values to stderr for fixture reference
+        eprintln!("FinalClaim linear_form_rlc: {:?}", base_elems(&fc.linear_form_rlc));
+        eprintln!("FinalClaim rlc_coefficients[0]: {:?}", base_elems(&fc.rlc_coefficients[0]));
+        for (i, r) in fc.evaluation_point.iter().enumerate() {
+            eprintln!("  eval_point[{}]: {:?}", i, base_elems(r));
+        }
+    }
 }

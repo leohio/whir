@@ -73,5 +73,11 @@ contract WhirVerifyTest is Test {
         p.finalDomainGenerator = uint64(vm.parseJsonUint(json, ".whir_params.final_domain_generator"));
         p.initialInterleavingDepth = vm.parseJsonUint(json, ".whir_params.initial_interleaving_depth");
         p.roundInterleavingDepth = vm.parseJsonUint(json, ".whir_params.round_interleaving_depth");
+        p.initialNumVariables = vm.parseJsonUint(json, ".whir_params.initial_num_variables");
+        p.roundInitialNumVariables = vm.parseJsonUint(json, ".whir_params.round_initial_num_variables");
+        p.initialCosetSize = vm.parseJsonUint(json, ".whir_params.initial_coset_size");
+        p.initialNumCosets = vm.parseJsonUint(json, ".whir_params.initial_num_cosets");
+        p.roundCosetSize = vm.parseJsonUint(json, ".whir_params.round_coset_size");
+        p.roundNumCosets = vm.parseJsonUint(json, ".whir_params.round_num_cosets");
     }
 }

@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {Keccak256Chain} from "./Keccak256Chain.sol";
+import {GoldilocksExt3} from "./GoldilocksExt3.sol";
 import {SpongefishMerkle} from "./SpongefishMerkle.sol";
 
 /// @title SpongefishWhir
@@ -37,16 +38,17 @@ library SpongefishWhir {
     ///      Matches: spongefish::DomainSeparator::new(protocol_id).session(session_id).instance(&Empty)
     function initTranscript(
         bytes memory protocolId,
-        bytes memory sessionId
+        bytes memory sessionId,
+        bytes memory instance
     ) internal pure returns (TranscriptState memory ts) {
         ts.sponge = Keccak256Chain.init();
         // public_message(&protocol_id) → absorb 64 bytes
         ts.sponge.absorb(protocolId);
         // public_message(&session_id) → absorb 32 bytes
-        if (sessionId.length > 0) {
-            ts.sponge.absorb(sessionId);
-        }
-        // public_message(&Empty) → absorb 0 bytes (no-op)
+        ts.sponge.absorb(sessionId);
+        // public_message(&instance) → absorb instance bytes
+        // NOTE: Even empty absorb changes state in Keccak256Chain: keccak256(state || "")
+        ts.sponge.absorb(instance);
     }
 
     /// @dev Read N bytes from transcript and absorb into sponge.
@@ -153,6 +155,7 @@ library SpongefishWhir {
 
     /// @dev Generate challenge indices by squeezing bytes and reducing mod numLeaves.
     ///      Matches: challenge_indices(transcript, num_leaves, count, deduplicate=true)
+    ///      IMPORTANT: Rust squeezes ONE BYTE AT A TIME via verifier_message::<u8>().
     function challengeIndices(
         TranscriptState memory ts,
         uint256 numLeaves,
@@ -165,13 +168,16 @@ library SpongefishWhir {
             return indices;
         }
 
-        // Calculate bytes needed per index
         uint256 sizeBytes = _ceilDiv(_log2(numLeaves), 8);
+        uint256 totalBytes = count * sizeBytes;
 
-        // Squeeze all needed bytes
-        bytes memory entropy = ts.sponge.squeeze(count * sizeBytes);
+        // Squeeze one byte at a time to match Rust
+        bytes memory entropy = new bytes(totalBytes);
+        for (uint256 i = 0; i < totalBytes; i++) {
+            bytes memory oneByte = ts.sponge.squeeze(1);
+            entropy[i] = oneByte[0];
+        }
 
-        // Convert to indices
         indices = new uint256[](count);
         for (uint256 i = 0; i < count; i++) {
             uint256 val = 0;
@@ -185,24 +191,25 @@ library SpongefishWhir {
         _sortAndDedup(indices);
     }
 
-    /// @dev Geometric challenge: squeeze one Field64 value, return [1, x, x^2, ..., x^(count-1)]
-    ///      Matches: geometric_challenge(transcript, count)
+    /// @dev Geometric challenge: squeeze one Field64_3 value, return [1, x, x^2, ..., x^(count-1)]
+    ///      Matches: geometric_challenge(transcript, count) where F = Ext3
     function geometricChallenge(
         TranscriptState memory ts,
         uint256 count
-    ) internal pure returns (uint64[] memory coeffs) {
-        if (count == 0) return new uint64[](0);
+    ) internal pure returns (GoldilocksExt3.Ext3[] memory coeffs) {
+        if (count == 0) return new GoldilocksExt3.Ext3[](0);
         if (count == 1) {
-            coeffs = new uint64[](1);
-            coeffs[0] = 1;
+            coeffs = new GoldilocksExt3.Ext3[](1);
+            coeffs[0] = GoldilocksExt3.one();
             return coeffs;
         }
 
-        uint64 x = verifierMessageField64(ts);
-        coeffs = new uint64[](count);
-        coeffs[0] = 1;
+        (uint64 c0, uint64 c1, uint64 c2) = verifierMessageField64x3(ts);
+        GoldilocksExt3.Ext3 memory x = GoldilocksExt3.Ext3(c0, c1, c2);
+        coeffs = new GoldilocksExt3.Ext3[](count);
+        coeffs[0] = GoldilocksExt3.one();
         for (uint256 i = 1; i < count; i++) {
-            coeffs[i] = _mulmod64(coeffs[i - 1], x);
+            coeffs[i] = GoldilocksExt3.mul(coeffs[i - 1], x);
         }
     }
 

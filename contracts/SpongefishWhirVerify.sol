@@ -59,8 +59,8 @@ library SpongefishWhirVerify {
         bytes32 prevRoot;
         // Initial OOD info (for FinalClaim)
         GoldilocksExt3.Ext3[] initialOodPoints;
-        uint64[] initialOodRlcCoeffs;
-        uint64[] initialConstraintRlc;
+        GoldilocksExt3.Ext3[] initialOodRlcCoeffs;
+        GoldilocksExt3.Ext3[] initialConstraintRlc;
         uint256 numLinearForms;
     }
 
@@ -68,12 +68,13 @@ library SpongefishWhirVerify {
     function verifyWhirProof(
         bytes memory protocolId,
         bytes memory sessionId,
+        bytes memory instance,
         bytes memory transcript,
         bytes memory hints,
         GoldilocksExt3.Ext3[] memory evaluations,
         WhirParams memory params
     ) internal pure returns (bool) {
-        SpongefishWhir.TranscriptState memory ts = SpongefishWhir.initTranscript(protocolId, sessionId);
+        SpongefishWhir.TranscriptState memory ts = SpongefishWhir.initTranscript(protocolId, sessionId, instance);
 
         VerifyState memory vs;
         vs.totalFoldingLen = params.initialSumcheckRounds
@@ -133,14 +134,14 @@ library SpongefishWhirVerify {
             oodMatrix[i] = GoldilocksExt3.Ext3(c0, c1, c2);
         }
 
-        // RLC coefficients
-        uint64[] memory vectorRlc = SpongefishWhir.geometricChallenge(ts, params.numVectors);
+        // RLC coefficients (extension field)
+        GoldilocksExt3.Ext3[] memory vectorRlc = SpongefishWhir.geometricChallenge(ts, params.numVectors);
         vs.numLinearForms = evaluations.length / params.numVectors;
         uint256 totalConstraints = params.outDomainSamples + vs.numLinearForms;
         vs.initialConstraintRlc = SpongefishWhir.geometricChallenge(ts, totalConstraints);
 
         // Store OOD RLC coefficients for FinalClaim
-        vs.initialOodRlcCoeffs = new uint64[](params.outDomainSamples);
+        vs.initialOodRlcCoeffs = new GoldilocksExt3.Ext3[](params.outDomainSamples);
         for (uint256 i = 0; i < params.outDomainSamples; i++) {
             vs.initialOodRlcCoeffs[i] = vs.initialConstraintRlc[vs.numLinearForms + i];
         }
@@ -152,18 +153,18 @@ library SpongefishWhirVerify {
         for (uint256 i = 0; i < vs.numLinearForms; i++) {
             GoldilocksExt3.Ext3 memory dotVal = GoldilocksExt3.zero();
             for (uint256 j = 0; j < params.numVectors; j++) {
-                dotVal = dotVal.add(evaluations[i * params.numVectors + j].mulScalar(vectorRlc[j]));
+                dotVal = dotVal.add(evaluations[i * params.numVectors + j].mul(vectorRlc[j]));
             }
-            vs.theSum = vs.theSum.add(dotVal.mulScalar(vs.initialConstraintRlc[i]));
+            vs.theSum = vs.theSum.add(dotVal.mul(vs.initialConstraintRlc[i]));
         }
 
         // Sum from OOD constraints
         for (uint256 i = 0; i < params.outDomainSamples; i++) {
             GoldilocksExt3.Ext3 memory dotVal = GoldilocksExt3.zero();
             for (uint256 j = 0; j < params.numVectors; j++) {
-                dotVal = dotVal.add(oodMatrix[i * params.numVectors + j].mulScalar(vectorRlc[j]));
+                dotVal = dotVal.add(oodMatrix[i * params.numVectors + j].mul(vectorRlc[j]));
             }
-            vs.theSum = vs.theSum.add(dotVal.mulScalar(vs.initialConstraintRlc[vs.numLinearForms + i]));
+            vs.theSum = vs.theSum.add(dotVal.mul(vs.initialConstraintRlc[vs.numLinearForms + i]));
         }
     }
 
@@ -266,8 +267,8 @@ library SpongefishWhirVerify {
             vs.prevRoot, openMD, sortedIndices, sortedHashes, hints, ts.hintPos
         );
 
-        // Constraint RLC
-        SpongefishWhir.geometricChallenge(ts, params.roundOutDomainSamples + sortedIndices.length);
+        // Constraint RLC — use raw (non-deduped) indices count, matching Rust's constraint_values.len()
+        SpongefishWhir.geometricChallenge(ts, params.roundOutDomainSamples + rawIndices.length);
 
         // Sumcheck
         _phaseSumcheck(ts, transcript, params.roundSumcheckRounds, vs);
@@ -373,7 +374,7 @@ library SpongefishWhirVerify {
 
     function _subtractOodConstraints(
         GoldilocksExt3.Ext3 memory linearFormRlc,
-        uint64[] memory rlcCoeffs,
+        GoldilocksExt3.Ext3[] memory rlcCoeffs,
         GoldilocksExt3.Ext3[] memory oodPoints,
         GoldilocksExt3.Ext3[] memory allFoldingR,
         uint256 totalFoldLen,
@@ -390,16 +391,14 @@ library SpongefishWhirVerify {
                 oodPoints[i], evalSuffix
             );
             // linearFormRlc -= rlcCoeffs[i] * mleVal
-            GoldilocksExt3.Ext3 memory term = mleVal.mulScalar(rlcCoeffs[i]);
-            linearFormRlc.c0 = uint64(addmod(uint256(linearFormRlc.c0), uint256(GL_P) - uint256(term.c0), uint256(GL_P)));
-            linearFormRlc.c1 = uint64(addmod(uint256(linearFormRlc.c1), uint256(GL_P) - uint256(term.c1), uint256(GL_P)));
-            linearFormRlc.c2 = uint64(addmod(uint256(linearFormRlc.c2), uint256(GL_P) - uint256(term.c2), uint256(GL_P)));
+            GoldilocksExt3.Ext3 memory term = mleVal.mul(rlcCoeffs[i]);
+            linearFormRlc = linearFormRlc.sub(term);
         }
     }
 
     function _verifyExternalLinearForms(
         GoldilocksExt3.Ext3 memory linearFormRlc,
-        uint64[] memory constraintRlc,
+        GoldilocksExt3.Ext3[] memory constraintRlc,
         uint256 numLinearForms,
         GoldilocksExt3.Ext3[] memory allFoldingR,
         uint256 numVariables
@@ -415,7 +414,7 @@ library SpongefishWhirVerify {
             GoldilocksExt3.Ext3 memory eqVal = WhirLinearAlgebra.mleEvaluateEq(
                 canonicalPoint, allFoldingR
             );
-            expectedRlc = expectedRlc.add(eqVal.mulScalar(constraintRlc[i]));
+            expectedRlc = expectedRlc.add(eqVal.mul(constraintRlc[i]));
         }
 
         require(GoldilocksExt3.eq(linearFormRlc, expectedRlc), "FinalClaim: linear form mismatch");
@@ -423,6 +422,11 @@ library SpongefishWhirVerify {
 
     /// @dev Generate challenge indices WITHOUT sorting/deduplication.
     ///      Matches Rust challenge_indices(transcript, num_leaves, count, deduplicate=false).
+    ///
+    ///      IMPORTANT: Rust squeezes ONE BYTE AT A TIME via verifier_message::<u8>().
+    ///      Each 1-byte squeeze in Keccak256Chain generates a full 32-byte keccak256
+    ///      block but only returns the first byte, discarding the rest.
+    ///      We must replicate this exact behavior.
     function _challengeIndicesUnsorted(
         SpongefishWhir.TranscriptState memory ts,
         uint256 numLeaves,
@@ -435,7 +439,14 @@ library SpongefishWhirVerify {
         }
 
         uint256 sizeBytes = _ceilDiv(_log2(numLeaves), 8);
-        bytes memory entropy = ts.sponge.squeeze(count * sizeBytes);
+        uint256 totalBytes = count * sizeBytes;
+
+        // Squeeze one byte at a time to match Rust's verifier_message::<u8>()
+        bytes memory entropy = new bytes(totalBytes);
+        for (uint256 i = 0; i < totalBytes; i++) {
+            bytes memory oneByte = ts.sponge.squeeze(1);
+            entropy[i] = oneByte[0];
+        }
 
         indices = new uint256[](count);
         for (uint256 i = 0; i < count; i++) {

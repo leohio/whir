@@ -73,7 +73,14 @@ library SpongefishMerkle {
                     ? (curHashes[i + 1], curHashes[i])
                     : (curHashes[i], curHashes[i + 1]);
                 nextIndices[nextLen] = a >> 1;
-                nextHashes[nextLen] = keccak256(abi.encodePacked(left, right));
+                bytes32 parentHash;
+                assembly {
+                    let scratch := mload(0x40)
+                    mstore(scratch, left)
+                    mstore(add(scratch, 32), right)
+                    parentHash := keccak256(scratch, 64)
+                }
+                nextHashes[nextLen] = parentHash;
                 nextLen++;
                 i += 2;
             } else {
@@ -89,7 +96,14 @@ library SpongefishMerkle {
                     ? (curHashes[i], sibling)
                     : (sibling, curHashes[i]);
                 nextIndices[nextLen] = a >> 1;
-                nextHashes[nextLen] = keccak256(abi.encodePacked(left, right));
+                bytes32 parentHash2;
+                assembly {
+                    let scratch := mload(0x40)
+                    mstore(scratch, left)
+                    mstore(add(scratch, 32), right)
+                    parentHash2 := keccak256(scratch, 64)
+                }
+                nextHashes[nextLen] = parentHash2;
                 nextLen++;
                 i++;
             }

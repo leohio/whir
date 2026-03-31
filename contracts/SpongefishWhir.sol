@@ -171,11 +171,10 @@ library SpongefishWhir {
         uint256 sizeBytes = _ceilDiv(_log2(numLeaves), 8);
         uint256 totalBytes = count * sizeBytes;
 
-        // Squeeze one byte at a time to match Rust
+        // Squeeze one byte at a time to match Rust (using SHA3 opcode directly)
         bytes memory entropy = new bytes(totalBytes);
         for (uint256 i = 0; i < totalBytes; i++) {
-            bytes memory oneByte = ts.sponge.squeeze(1);
-            entropy[i] = oneByte[0];
+            entropy[i] = bytes1(ts.sponge.squeezeByte());
         }
 
         indices = new uint256[](count);

@@ -226,12 +226,15 @@ library SpongefishWhirVerify {
         // Receive new commitment
         bytes32 roundRoot = SpongefishWhir.proverMessageHash(ts, transcript);
 
-        // OOD for this round (need to store both points and answers for constraint values)
+        // OOD for this round: ALL points squeezed first, then ALL answers absorbed
+        // (matches Rust irs_commit::receive_commitment order)
         GoldilocksExt3.Ext3[] memory roundOodPoints = new GoldilocksExt3.Ext3[](params.roundOutDomainSamples);
-        GoldilocksExt3.Ext3[] memory roundOodAnswers = new GoldilocksExt3.Ext3[](params.roundOutDomainSamples);
         for (uint256 i = 0; i < params.roundOutDomainSamples; i++) {
             (uint64 c0, uint64 c1, uint64 c2) = SpongefishWhir.verifierMessageField64x3(ts);
             roundOodPoints[i] = GoldilocksExt3.Ext3(c0, c1, c2);
+        }
+        GoldilocksExt3.Ext3[] memory roundOodAnswers = new GoldilocksExt3.Ext3[](params.roundOutDomainSamples);
+        for (uint256 i = 0; i < params.roundOutDomainSamples; i++) {
             (uint64 a0, uint64 a1, uint64 a2) = SpongefishWhir.proverMessageField64x3(ts, transcript);
             roundOodAnswers[i] = GoldilocksExt3.Ext3(a0, a1, a2);
         }
@@ -283,7 +286,7 @@ library SpongefishWhirVerify {
         bytes32[] memory rawFinalHashes = new bytes32[](rawFinalIndices.length);
         for (uint256 i = 0; i < rawFinalIndices.length; i++) {
             bytes memory rowData = SpongefishWhir.proverHint(ts, hints, finalRowBytes);
-            rawFinalHashes[i] = keccak256(rowData);
+            rawFinalHashes[i] = _keccak256Bytes(rowData);
         }
 
         (uint256[] memory sortedFinalIndices, bytes32[] memory sortedFinalHashes) =
@@ -381,8 +384,7 @@ library SpongefishWhirVerify {
 
         bytes memory entropy = new bytes(totalBytes);
         for (uint256 i = 0; i < totalBytes; i++) {
-            bytes memory oneByte = ts.sponge.squeeze(1);
-            entropy[i] = oneByte[0];
+            entropy[i] = bytes1(ts.sponge.squeezeByte());
         }
 
         indices = new uint256[](count);
@@ -423,6 +425,13 @@ library SpongefishWhirVerify {
         }
         assembly { mstore(indices, write) mstore(hashes, write) }
         return (indices, hashes);
+    }
+
+    /// @dev keccak256 of bytes using SHA3 opcode directly.
+    function _keccak256Bytes(bytes memory data) private pure returns (bytes32 result) {
+        assembly {
+            result := keccak256(add(data, 0x20), mload(data))
+        }
     }
 
     /// @dev Goldilocks modular exponentiation: base^exp mod GL_P
@@ -495,7 +504,7 @@ library SpongefishWhirVerify {
 
         for (uint256 i = 0; i < rawCount; i++) {
             bytes memory rowData = SpongefishWhir.proverHint(ts, hints, o.rowBytes);
-            rawLeafHashes[i] = keccak256(rowData);
+            rawLeafHashes[i] = _keccak256Bytes(rowData);
             decodedRows[i] = _decodeRow(rowData, o.numCols, o.isBaseField);
         }
 

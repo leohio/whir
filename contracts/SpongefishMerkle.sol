@@ -33,12 +33,27 @@ library SpongefishMerkle {
 
         uint256[] memory curIndices = indices;
         bytes32[] memory curHashes = leafHashes;
+        uint256[] memory nextIndices = new uint256[](indices.length);
+        bytes32[] memory nextHashes = new bytes32[](leafHashes.length);
         newHintOffset = hintOffset;
 
         for (uint256 layer = 0; layer < numLayers; layer++) {
-            (curIndices, curHashes, newHintOffset) = _processLayer(
-                curIndices, curHashes, hints, newHintOffset
+            uint256 nextLen = _processLayerInto(
+                curIndices, curHashes, nextIndices, nextHashes, hints, newHintOffset
             );
+            unchecked {
+                uint256 curLen = curIndices.length;
+                uint256 loneCount = nextLen * 2 > curLen ? (nextLen * 2) - curLen : 0;
+                newHintOffset += loneCount * 32;
+            }
+
+            assembly {
+                mstore(nextIndices, nextLen)
+                mstore(nextHashes, nextLen)
+            }
+
+            (curIndices, nextIndices) = (nextIndices, curIndices);
+            (curHashes, nextHashes) = (nextHashes, curHashes);
         }
 
         // Should be left with a single root
@@ -48,21 +63,16 @@ library SpongefishMerkle {
     }
 
     /// @dev Process one Merkle tree layer: merge siblings, read hints for lone nodes.
-    function _processLayer(
+    function _processLayerInto(
         uint256[] memory curIndices,
         bytes32[] memory curHashes,
-        bytes memory hints,
-        uint256 hintOff
-    ) private pure returns (
         uint256[] memory nextIndices,
         bytes32[] memory nextHashes,
-        uint256 newHintOff
-    ) {
+        bytes memory hints,
+        uint256 hintOff
+    ) private pure returns (uint256 nextLen) {
         uint256 n = curIndices.length;
-        nextIndices = new uint256[](n);
-        nextHashes = new bytes32[](n);
-        uint256 nextLen = 0;
-        newHintOff = hintOff;
+        uint256 newHintOff = hintOff;
 
         uint256 i = 0;
         while (i < n) {
@@ -109,9 +119,5 @@ library SpongefishMerkle {
             }
         }
 
-        assembly {
-            mstore(nextIndices, nextLen)
-            mstore(nextHashes, nextLen)
-        }
     }
 }

@@ -107,7 +107,7 @@ library SpongefishWhirVerify {
         _phaseSumcheck(ts, transcript, params.finalSumcheckRounds, vs);
 
         // Phase 6: FinalClaim verification
-        _phaseFinalClaim(params, vs, finalVector, evaluations);
+        _phaseFinalClaim(params, vs, finalVector);
 
         require(ts.transcriptPos == transcript.length, "transcript not fully consumed");
         return true;
@@ -303,16 +303,12 @@ library SpongefishWhirVerify {
     function _phaseFinalClaim(
         WhirParams memory params,
         VerifyState memory vs,
-        GoldilocksExt3.Ext3[] memory finalVector,
-        GoldilocksExt3.Ext3[] memory evaluations
+        GoldilocksExt3.Ext3[] memory finalVector
     ) private pure {
         // poly_eval = dot(eq_weights(final_sumcheck_r), finalVector)
-        GoldilocksExt3.Ext3[] memory finalSumcheckR = new GoldilocksExt3.Ext3[](params.finalSumcheckRounds);
-        for (uint256 i = 0; i < params.finalSumcheckRounds; i++) {
-            finalSumcheckR[i] = vs.allFoldingRandomness[vs.foldIdx - params.finalSumcheckRounds + i];
-        }
-        GoldilocksExt3.Ext3[] memory eqW = WhirLinearAlgebra.eqWeights(finalSumcheckR);
-        GoldilocksExt3.Ext3 memory polyEval = WhirLinearAlgebra.dotProduct(eqW, finalVector);
+        // Use in-place fold: v'[i] = v[2i]*(1-r) + v[2i+1]*r, repeated for each randomness
+        uint256 foldStart = vs.foldIdx - params.finalSumcheckRounds;
+        GoldilocksExt3.Ext3 memory polyEval = _foldEval(finalVector, vs.allFoldingRandomness, foldStart, params.finalSumcheckRounds);
         require(!GoldilocksExt3.isZero(polyEval), "polyEval is zero");
 
         // linear_form_rlc = theSum / polyEval
@@ -325,14 +321,10 @@ library SpongefishWhirVerify {
 
             uint256 nv = entry.numVariables;
             uint256 start = vs.totalFoldingLen > nv ? vs.totalFoldingLen - nv : 0;
-            GoldilocksExt3.Ext3[] memory evalSlice = new GoldilocksExt3.Ext3[](vs.totalFoldingLen - start);
-            for (uint256 i = 0; i < evalSlice.length; i++) {
-                evalSlice[i] = vs.allFoldingRandomness[start + i];
-            }
 
             for (uint256 i = 0; i < entry.rlcCoeffs.length; i++) {
-                GoldilocksExt3.Ext3 memory mleVal = WhirLinearAlgebra.mleEvaluateUnivariate(
-                    entry.univariatePoints[i], evalSlice
+                GoldilocksExt3.Ext3 memory mleVal = WhirLinearAlgebra.mleEvaluateUnivariateFrom(
+                    entry.univariatePoints[i], vs.allFoldingRandomness, start
                 );
                 GoldilocksExt3.Ext3 memory term = mleVal.mul(entry.rlcCoeffs[i]);
                 GoldilocksExt3.Ext3 memory result = linearFormRlc.sub(term);
@@ -342,24 +334,16 @@ library SpongefishWhirVerify {
             }
         }
 
-        // Verify external linear forms
-        // linear_form = MultilinearExtension at canonical point (1, 2, ..., numVariables)
-        // FinalClaim.verify: sum(rlc_coeff[i] * eq(canonical, evaluation_point)) == linear_form_rlc
-        GoldilocksExt3.Ext3[] memory canonicalPoint = new GoldilocksExt3.Ext3[](params.numVariables);
-        for (uint256 i = 0; i < params.numVariables; i++) {
-            canonicalPoint[i] = GoldilocksExt3.fromBase(uint64(i + 1));
-        }
-
-        GoldilocksExt3.Ext3 memory expectedRlc = GoldilocksExt3.zero();
+        GoldilocksExt3.Ext3 memory initialLinearFormRlcSum = GoldilocksExt3.zero();
         for (uint256 i = 0; i < vs.numLinearForms; i++) {
-            GoldilocksExt3.Ext3 memory eqVal = WhirLinearAlgebra.mleEvaluateEq(
-                canonicalPoint, vs.allFoldingRandomness
-            );
-            GoldilocksExt3.Ext3 memory result = expectedRlc.add(eqVal.mul(vs.initialConstraintRlc[i]));
-            expectedRlc.c0 = result.c0;
-            expectedRlc.c1 = result.c1;
-            expectedRlc.c2 = result.c2;
+            GoldilocksExt3.Ext3 memory result = initialLinearFormRlcSum.add(vs.initialConstraintRlc[i]);
+            initialLinearFormRlcSum.c0 = result.c0;
+            initialLinearFormRlcSum.c1 = result.c1;
+            initialLinearFormRlcSum.c2 = result.c2;
         }
+        GoldilocksExt3.Ext3 memory expectedRlc = WhirLinearAlgebra.mleEvaluateEqCanonical(
+            params.numVariables, vs.allFoldingRandomness
+        ).mul(initialLinearFormRlcSum);
 
         require(GoldilocksExt3.eq(linearFormRlc, expectedRlc), "FinalClaim: linear form mismatch");
     }
@@ -478,29 +462,6 @@ library SpongefishWhirVerify {
         return val;
     }
 
-    /// @dev Decode a row from hints buffer at given offset (zero-copy).
-    function _decodeRowAt(
-        bytes memory hints,
-        uint256 rowOff,
-        uint256 numCols,
-        bool isBaseField
-    ) private pure returns (GoldilocksExt3.Ext3[] memory cols) {
-        cols = new GoldilocksExt3.Ext3[](numCols);
-        if (isBaseField) {
-            for (uint256 j = 0; j < numCols; j++) {
-                cols[j] = GoldilocksExt3.fromBase(_readU64LEAt(hints, rowOff, j * 8));
-            }
-        } else {
-            for (uint256 j = 0; j < numCols; j++) {
-                cols[j] = GoldilocksExt3.Ext3(
-                    _readU64LEAt(hints, rowOff, j * 24),
-                    _readU64LEAt(hints, rowOff, j * 24 + 8),
-                    _readU64LEAt(hints, rowOff, j * 24 + 16)
-                );
-            }
-        }
-    }
-
     /// @dev Goldilocks modular exponentiation: base^exp mod GL_P
     function _glPow(uint64 base, uint256 exp) private pure returns (uint64) {
         uint256 result = 1;
@@ -567,12 +528,12 @@ library SpongefishWhirVerify {
         ts.hintPos += 8; // skip Vec<T> length prefix (zero-copy)
 
         bytes32[] memory rawLeafHashes = new bytes32[](rawCount);
-        GoldilocksExt3.Ext3[][] memory decodedRows = new GoldilocksExt3.Ext3[][](rawCount);
+        uint256[] memory rowOffsets = new uint256[](rawCount);
 
         for (uint256 i = 0; i < rawCount; i++) {
             uint256 rowOff = ts.hintPos;
+            rowOffsets[i] = rowOff;
             rawLeafHashes[i] = _keccak256At(hints, rowOff, o.rowBytes);
-            decodedRows[i] = _decodeRowAt(hints, rowOff, o.numCols, o.isBaseField);
             ts.hintPos += o.rowBytes;
         }
 
@@ -587,29 +548,8 @@ library SpongefishWhirVerify {
             vs.prevRoot, o.md, sortedIndices, sortedHashes, hints, ts.hintPos
         );
 
-        _addConstraintValues(ts, params, vs, round, rawCount, roundOodAnswers,
-            roundOodPoints, decodedRows, inDomainEvalPoints);
-    }
-
-    function _decodeRow(
-        bytes memory rowData,
-        uint256 numCols,
-        bool isBaseField
-    ) private pure returns (GoldilocksExt3.Ext3[] memory cols) {
-        cols = new GoldilocksExt3.Ext3[](numCols);
-        if (isBaseField) {
-            for (uint256 j = 0; j < numCols; j++) {
-                cols[j] = GoldilocksExt3.fromBase(_readU64LE(rowData, j * 8));
-            }
-        } else {
-            for (uint256 j = 0; j < numCols; j++) {
-                cols[j] = GoldilocksExt3.Ext3(
-                    _readU64LE(rowData, j * 24),
-                    _readU64LE(rowData, j * 24 + 8),
-                    _readU64LE(rowData, j * 24 + 16)
-                );
-            }
-        }
+        _addConstraintValues(ts, hints, params, vs, round, rawCount, roundOodAnswers,
+            roundOodPoints, rowOffsets, inDomainEvalPoints, o.numCols, o.isBaseField);
     }
 
     function _computeEvalPoints(
@@ -631,22 +571,22 @@ library SpongefishWhirVerify {
 
     function _addConstraintValues(
         SpongefishWhir.TranscriptState memory ts,
+        bytes memory hints,
         WhirParams memory params,
         VerifyState memory vs,
         uint256 round,
         uint256 rawCount,
         GoldilocksExt3.Ext3[] memory roundOodAnswers,
         GoldilocksExt3.Ext3[] memory roundOodPoints,
-        GoldilocksExt3.Ext3[][] memory decodedRows,
-        GoldilocksExt3.Ext3[] memory inDomainEvalPoints
+        uint256[] memory rowOffsets,
+        GoldilocksExt3.Ext3[] memory inDomainEvalPoints,
+        uint256 numCols,
+        bool isBaseField
     ) private pure {
-        // eq_weights from last folding randomness
+        // eq_weights from last folding randomness (read directly, no copy)
         uint256 ff = (round == 0) ? params.initialSumcheckRounds : params.roundSumcheckRounds;
-        GoldilocksExt3.Ext3[] memory lastFoldR = new GoldilocksExt3.Ext3[](ff);
-        for (uint256 i = 0; i < ff; i++) {
-            lastFoldR[i] = vs.allFoldingRandomness[vs.foldIdx - ff + i];
-        }
-        GoldilocksExt3.Ext3[] memory eqW = WhirLinearAlgebra.eqWeights(lastFoldR);
+        uint256 eqBase = vs.foldIdx - ff;
+        GoldilocksExt3.Ext3[] memory eqW = WhirLinearAlgebra.eqWeightsFrom(vs.allFoldingRandomness, eqBase, ff);
 
         // Constraint RLC
         uint256 constraintCount = params.roundOutDomainSamples + rawCount;
@@ -657,9 +597,9 @@ library SpongefishWhirVerify {
             vs.theSum = vs.theSum.add(roundOodAnswers[i].mul(roundRlc[i]));
         }
 
-        // Add in-domain constraint values
+        // Add in-domain constraint values (streaming: decode + dot in one pass)
         for (uint256 i = 0; i < rawCount; i++) {
-            GoldilocksExt3.Ext3 memory val = GoldilocksExt3.dot(eqW, decodedRows[i]);
+            GoldilocksExt3.Ext3 memory val = _dotEqWithRow(eqW, hints, rowOffsets[i], numCols, isBaseField);
             vs.theSum = vs.theSum.add(val.mul(roundRlc[params.roundOutDomainSamples + i]));
         }
 
@@ -679,10 +619,55 @@ library SpongefishWhirVerify {
         });
     }
 
-    /// @dev Read a uint64 in little-endian from a byte array at the given offset.
-    function _readU64LE(bytes memory data, uint256 offset) private pure returns (uint64 val) {
-        for (uint256 i = 0; i < 8; i++) {
-            val |= uint64(uint8(data[offset + i])) << uint64(i * 8);
+    /// @dev Evaluate dot(eq_weights(r), vector) by in-place folding (no eqWeights alloc).
+    ///      Fold in REVERSE order: last randomness first (matching eqWeights bit convention).
+    ///      eqWeights[i] = ⊗_j (bit_j(i) ? r_j : 1-r_j) where j=0 is LSB.
+    ///      So folding pairs by MSB (last r) first preserves the correct dot product.
+    ///      Mutates `vec` in place.
+    function _foldEval(
+        GoldilocksExt3.Ext3[] memory vec,
+        GoldilocksExt3.Ext3[] memory randomness,
+        uint256 rStart,
+        uint256 numRounds
+    ) private pure returns (GoldilocksExt3.Ext3 memory) {
+        uint256 size = vec.length;
+        GoldilocksExt3.Ext3 memory one_ = GoldilocksExt3.one();
+        for (uint256 round = numRounds; round > 0; round--) {
+            GoldilocksExt3.Ext3 memory r = randomness[rStart + round - 1];
+            GoldilocksExt3.Ext3 memory oneMinusR = one_.sub(r);
+            uint256 half = size >> 1;
+            for (uint256 i = 0; i < half; i++) {
+                // vec[i] = vec[2i] * (1-r) + vec[2i+1] * r
+                vec[i] = vec[2 * i].mul(oneMinusR).add(vec[2 * i + 1].mul(r));
+            }
+            size = half;
+        }
+        return vec[0];
+    }
+
+    /// @dev Compute dot(eqW, row) by reading row fields directly from hints (no row alloc).
+    function _dotEqWithRow(
+        GoldilocksExt3.Ext3[] memory eqW,
+        bytes memory hints,
+        uint256 rowOff,
+        uint256 numCols,
+        bool isBaseField
+    ) private pure returns (GoldilocksExt3.Ext3 memory acc) {
+        acc = GoldilocksExt3.zero();
+        if (isBaseField) {
+            for (uint256 j = 0; j < numCols; j++) {
+                uint64 v = _readU64LEAt(hints, rowOff, j * 8);
+                acc = acc.add(eqW[j].mulScalar(v));
+            }
+        } else {
+            for (uint256 j = 0; j < numCols; j++) {
+                GoldilocksExt3.Ext3 memory col = GoldilocksExt3.Ext3(
+                    _readU64LEAt(hints, rowOff, j * 24),
+                    _readU64LEAt(hints, rowOff, j * 24 + 8),
+                    _readU64LEAt(hints, rowOff, j * 24 + 16)
+                );
+                acc = acc.add(eqW[j].mul(col));
+            }
         }
     }
 

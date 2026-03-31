@@ -64,6 +64,47 @@ library WhirLinearAlgebra {
         }
     }
 
+    /// @dev Same as mleEvaluateUnivariate(), but reads a suffix of the point in-place.
+    function mleEvaluateUnivariateFrom(
+        GoldilocksExt3.Ext3 memory x,
+        GoldilocksExt3.Ext3[] memory point,
+        uint256 start
+    ) internal pure returns (GoldilocksExt3.Ext3 memory result) {
+        result = GoldilocksExt3.one();
+        GoldilocksExt3.Ext3 memory x2i = x;
+        GoldilocksExt3.Ext3 memory one_ = GoldilocksExt3.one();
+
+        for (uint256 i = point.length; i > start; i--) {
+            GoldilocksExt3.Ext3 memory r = point[i - 1];
+            GoldilocksExt3.Ext3 memory term = one_.sub(r).add(r.mul(x2i));
+            result = result.mul(term);
+            x2i = x2i.square();
+        }
+    }
+
+    /// @dev Compute eq_weights from a slice of a larger array (avoids copy).
+    function eqWeightsFrom(
+        GoldilocksExt3.Ext3[] memory arr,
+        uint256 start,
+        uint256 count
+    ) internal pure returns (GoldilocksExt3.Ext3[] memory weights) {
+        uint256 size = 1 << count;
+        weights = new GoldilocksExt3.Ext3[](size);
+        weights[0] = GoldilocksExt3.one();
+
+        GoldilocksExt3.Ext3 memory one_ = GoldilocksExt3.one();
+        uint256 half = 1;
+        for (uint256 i = 0; i < count; i++) {
+            GoldilocksExt3.Ext3 memory ri = arr[start + i];
+            GoldilocksExt3.Ext3 memory oneMinusRi = one_.sub(ri);
+            for (uint256 j = half; j > 0; j--) {
+                weights[2 * (j - 1) + 1] = weights[j - 1].mul(ri);
+                weights[2 * (j - 1)] = weights[j - 1].mul(oneMinusRi);
+            }
+            half <<= 1;
+        }
+    }
+
     /// @dev Compute eq_weights: the tensor product basis for eq polynomial.
     ///
     ///   eq_weights(r) = ⊗_i (1-r_i, r_i)
@@ -88,6 +129,25 @@ library WhirLinearAlgebra {
                 weights[2 * (j - 1)] = weights[j - 1].mul(oneMinusRi);
             }
             half <<= 1;
+        }
+    }
+
+    /// @dev Evaluate eq((1, 2, ..., numVariables), evalPoint) without materializing the point.
+    function mleEvaluateEqCanonical(
+        uint256 numVariables,
+        GoldilocksExt3.Ext3[] memory evalPoint
+    ) internal pure returns (GoldilocksExt3.Ext3 memory result) {
+        result = GoldilocksExt3.one();
+        uint256 n = numVariables < evalPoint.length ? numVariables : evalPoint.length;
+        GoldilocksExt3.Ext3 memory one_ = GoldilocksExt3.one();
+        for (uint256 i = 0; i < n; i++) {
+            GoldilocksExt3.Ext3 memory l = GoldilocksExt3.fromBase(uint64(i + 1));
+            GoldilocksExt3.Ext3 memory r = evalPoint[i];
+            GoldilocksExt3.Ext3 memory lr = l.mul(r);
+            GoldilocksExt3.Ext3 memory oneMinusL = one_.sub(l);
+            GoldilocksExt3.Ext3 memory oneMinusR = one_.sub(r);
+            GoldilocksExt3.Ext3 memory term = lr.add(oneMinusL.mul(oneMinusR));
+            result = result.mul(term);
         }
     }
 

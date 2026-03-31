@@ -204,11 +204,31 @@ library SpongefishWhir {
         }
 
         (uint64 c0, uint64 c1, uint64 c2) = verifierMessageField64x3(ts);
-        GoldilocksExt3.Ext3 memory x = GoldilocksExt3.Ext3(c0, c1, c2);
         coeffs = new GoldilocksExt3.Ext3[](count);
         coeffs[0] = GoldilocksExt3.one();
         for (uint256 i = 1; i < count; i++) {
-            coeffs[i] = GoldilocksExt3.mul(coeffs[i - 1], x);
+            coeffs[i] = GoldilocksExt3.zero();
+        }
+        // Fill geometric sequence in assembly: coeffs[i] = coeffs[i-1] * x
+        assembly {
+            let p := 0xFFFFFFFF00000001
+            let x0 := c0
+            let x1 := c1
+            let x2 := c2
+            let cData := add(coeffs, 0x20)
+
+            for { let i := 1 } lt(i, count) { i := add(i, 1) } {
+                let prevPtr := mload(add(cData, mul(sub(i, 1), 0x20)))
+                let p0 := mload(prevPtr)
+                let p1 := mload(add(prevPtr, 0x20))
+                let p2 := mload(add(prevPtr, 0x40))
+
+                let t := addmod(mulmod(p1, x2, p), mulmod(p2, x1, p), p)
+                let curPtr := mload(add(cData, mul(i, 0x20)))
+                mstore(curPtr, addmod(mulmod(p0, x0, p), mulmod(2, t, p), p))
+                mstore(add(curPtr, 0x20), addmod(addmod(mulmod(p0, x1, p), mulmod(p1, x0, p), p), mulmod(2, mulmod(p2, x2, p), p), p))
+                mstore(add(curPtr, 0x40), addmod(addmod(mulmod(p0, x2, p), mulmod(p1, x1, p), p), mulmod(p2, x0, p), p))
+            }
         }
     }
 

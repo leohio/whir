@@ -158,22 +158,10 @@ library SpongefishWhirVerify {
             numVariables: params.initialNumVariables
         });
 
-        // Compute "the sum"
+        // Compute "the sum" — inline assembly to avoid intermediate Ext3 allocs
         vs.theSum = GoldilocksExt3.zero();
-        for (uint256 i = 0; i < vs.numLinearForms; i++) {
-            GoldilocksExt3.Ext3 memory dotVal = GoldilocksExt3.zero();
-            for (uint256 j = 0; j < params.numVectors; j++) {
-                dotVal = dotVal.add(evaluations[i * params.numVectors + j].mul(vectorRlc[j]));
-            }
-            vs.theSum = vs.theSum.add(dotVal.mul(vs.initialConstraintRlc[i]));
-        }
-        for (uint256 i = 0; i < params.outDomainSamples; i++) {
-            GoldilocksExt3.Ext3 memory dotVal = GoldilocksExt3.zero();
-            for (uint256 j = 0; j < params.numVectors; j++) {
-                dotVal = dotVal.add(oodMatrix[i * params.numVectors + j].mul(vectorRlc[j]));
-            }
-            vs.theSum = vs.theSum.add(dotVal.mul(vs.initialConstraintRlc[vs.numLinearForms + i]));
-        }
+        _accumulateTheSum(vs.theSum, evaluations, vectorRlc, vs.initialConstraintRlc, 0, vs.numLinearForms, params.numVectors);
+        _accumulateTheSum(vs.theSum, oodMatrix, vectorRlc, vs.initialConstraintRlc, vs.numLinearForms, params.outDomainSamples, params.numVectors);
     }
 
     // =====================================================================
@@ -188,15 +176,48 @@ library SpongefishWhirVerify {
         for (uint256 i = 0; i < numRounds; i++) {
             (uint64 c0a, uint64 c0b, uint64 c0c) = SpongefishWhir.proverMessageField64x3(ts, transcript);
             (uint64 c2a, uint64 c2b, uint64 c2c) = SpongefishWhir.proverMessageField64x3(ts, transcript);
-            GoldilocksExt3.Ext3 memory c0 = GoldilocksExt3.Ext3(c0a, c0b, c0c);
-            GoldilocksExt3.Ext3 memory c2 = GoldilocksExt3.Ext3(c2a, c2b, c2c);
-            GoldilocksExt3.Ext3 memory c1 = vs.theSum.sub(c0.double_()).sub(c2);
 
             (uint64 ra, uint64 rb, uint64 rc) = SpongefishWhir.verifierMessageField64x3(ts);
-            GoldilocksExt3.Ext3 memory r = GoldilocksExt3.Ext3(ra, rb, rc);
-            vs.allFoldingRandomness[vs.foldIdx++] = r;
+            // Store r into allFoldingRandomness
+            GoldilocksExt3.Ext3 memory rElem = vs.allFoldingRandomness[vs.foldIdx++];
+            rElem.c0 = ra; rElem.c1 = rb; rElem.c2 = rc;
 
-            vs.theSum = c2.mul(r).add(c1).mul(r).add(c0);
+            // Compute c1 = theSum - 2*c0 - c2, then theSum = ((c2 * r) + c1) * r + c0
+            // All on stack to avoid intermediate Ext3 allocs
+            assembly {
+                let p := 0xFFFFFFFF00000001
+                let theSumPtr := mload(vs) // vs.theSum is first field
+                let s0 := mload(theSumPtr)
+                let s1 := mload(add(theSumPtr, 0x20))
+                let s2 := mload(add(theSumPtr, 0x40))
+
+                // c1 = theSum - 2*c0 - c2
+                let c1_0 := addmod(s0, sub(p, addmod(addmod(c0a, c0a, p), c2a, p)), p)
+                let c1_1 := addmod(s1, sub(p, addmod(addmod(c0b, c0b, p), c2b, p)), p)
+                let c1_2 := addmod(s2, sub(p, addmod(addmod(c0c, c0c, p), c2c, p)), p)
+
+                // tmp = c2 * r (Ext3 mul)
+                let t1 := addmod(mulmod(c2b, rc, p), mulmod(c2c, rb, p), p)
+                let tmp0 := addmod(mulmod(c2a, ra, p), mulmod(2, t1, p), p)
+                let tmp1 := addmod(addmod(mulmod(c2a, rb, p), mulmod(c2b, ra, p), p), mulmod(2, mulmod(c2c, rc, p), p), p)
+                let tmp2 := addmod(addmod(mulmod(c2a, rc, p), mulmod(c2b, rb, p), p), mulmod(c2c, ra, p), p)
+
+                // tmp = tmp + c1
+                tmp0 := addmod(tmp0, c1_0, p)
+                tmp1 := addmod(tmp1, c1_1, p)
+                tmp2 := addmod(tmp2, c1_2, p)
+
+                // tmp = tmp * r (Ext3 mul)
+                let t2 := addmod(mulmod(tmp1, rc, p), mulmod(tmp2, rb, p), p)
+                let new0 := addmod(mulmod(tmp0, ra, p), mulmod(2, t2, p), p)
+                let new1 := addmod(addmod(mulmod(tmp0, rb, p), mulmod(tmp1, ra, p), p), mulmod(2, mulmod(tmp2, rc, p), p), p)
+                let new2 := addmod(addmod(mulmod(tmp0, rc, p), mulmod(tmp1, rb, p), p), mulmod(tmp2, ra, p), p)
+
+                // theSum = tmp + c0
+                mstore(theSumPtr, addmod(new0, c0a, p))
+                mstore(add(theSumPtr, 0x20), addmod(new1, c0b, p))
+                mstore(add(theSumPtr, 0x40), addmod(new2, c0c, p))
+            }
         }
     }
 
@@ -326,26 +347,72 @@ library SpongefishWhirVerify {
                 GoldilocksExt3.Ext3 memory mleVal = WhirLinearAlgebra.mleEvaluateUnivariateFrom(
                     entry.univariatePoints[i], vs.allFoldingRandomness, start
                 );
-                GoldilocksExt3.Ext3 memory term = mleVal.mul(entry.rlcCoeffs[i]);
-                GoldilocksExt3.Ext3 memory result = linearFormRlc.sub(term);
-                linearFormRlc.c0 = result.c0;
-                linearFormRlc.c1 = result.c1;
-                linearFormRlc.c2 = result.c2;
+                // linearFormRlc -= mleVal * coeff (inline assembly, no intermediate allocs)
+                GoldilocksExt3.Ext3 memory coeff = entry.rlcCoeffs[i];
+                assembly {
+                    let p := 0xFFFFFFFF00000001
+                    let m0 := mload(mleVal)
+                    let m1 := mload(add(mleVal, 0x20))
+                    let m2 := mload(add(mleVal, 0x40))
+                    let co0 := mload(coeff)
+                    let co1 := mload(add(coeff, 0x20))
+                    let co2 := mload(add(coeff, 0x40))
+                    // term = mleVal * coeff
+                    let t := addmod(mulmod(m1, co2, p), mulmod(m2, co1, p), p)
+                    let t0 := addmod(mulmod(m0, co0, p), mulmod(2, t, p), p)
+                    let t1 := addmod(addmod(mulmod(m0, co1, p), mulmod(m1, co0, p), p), mulmod(2, mulmod(m2, co2, p), p), p)
+                    let t2 := addmod(addmod(mulmod(m0, co2, p), mulmod(m1, co1, p), p), mulmod(m2, co0, p), p)
+                    // linearFormRlc -= term
+                    mstore(linearFormRlc, addmod(mload(linearFormRlc), sub(p, t0), p))
+                    mstore(add(linearFormRlc, 0x20), addmod(mload(add(linearFormRlc, 0x20)), sub(p, t1), p))
+                    mstore(add(linearFormRlc, 0x40), addmod(mload(add(linearFormRlc, 0x40)), sub(p, t2), p))
+                }
             }
         }
 
+        // Sum initial constraint RLC coefficients
         GoldilocksExt3.Ext3 memory initialLinearFormRlcSum = GoldilocksExt3.zero();
-        for (uint256 i = 0; i < vs.numLinearForms; i++) {
-            GoldilocksExt3.Ext3 memory result = initialLinearFormRlcSum.add(vs.initialConstraintRlc[i]);
-            initialLinearFormRlcSum.c0 = result.c0;
-            initialLinearFormRlcSum.c1 = result.c1;
-            initialLinearFormRlcSum.c2 = result.c2;
+        {
+            GoldilocksExt3.Ext3[] memory icRlc = vs.initialConstraintRlc;
+            uint256 nLF = vs.numLinearForms;
+            assembly {
+                let p := 0xFFFFFFFF00000001
+                let s0 := 0
+                let s1 := 0
+                let s2 := 0
+                let icData := add(icRlc, 0x20)
+                for { let i := 0 } lt(i, nLF) { i := add(i, 1) } {
+                    let ePtr := mload(add(icData, mul(i, 0x20)))
+                    s0 := addmod(s0, mload(ePtr), p)
+                    s1 := addmod(s1, mload(add(ePtr, 0x20)), p)
+                    s2 := addmod(s2, mload(add(ePtr, 0x40)), p)
+                }
+                mstore(initialLinearFormRlcSum, s0)
+                mstore(add(initialLinearFormRlcSum, 0x20), s1)
+                mstore(add(initialLinearFormRlcSum, 0x40), s2)
+            }
         }
-        GoldilocksExt3.Ext3 memory expectedRlc = WhirLinearAlgebra.mleEvaluateEqCanonical(
-            params.numVariables, vs.allFoldingRandomness
-        ).mul(initialLinearFormRlcSum);
 
-        require(GoldilocksExt3.eq(linearFormRlc, expectedRlc), "FinalClaim: linear form mismatch");
+        // expectedRlc = mleEvaluateEqCanonical(...) * initialLinearFormRlcSum
+        GoldilocksExt3.Ext3 memory eqVal = WhirLinearAlgebra.mleEvaluateEqCanonical(
+            params.numVariables, vs.allFoldingRandomness
+        );
+        // Multiply in-place
+        assembly {
+            let p := 0xFFFFFFFF00000001
+            let a0 := mload(eqVal)
+            let a1 := mload(add(eqVal, 0x20))
+            let a2 := mload(add(eqVal, 0x40))
+            let b0 := mload(initialLinearFormRlcSum)
+            let b1 := mload(add(initialLinearFormRlcSum, 0x20))
+            let b2 := mload(add(initialLinearFormRlcSum, 0x40))
+            let t := addmod(mulmod(a1, b2, p), mulmod(a2, b1, p), p)
+            mstore(eqVal, addmod(mulmod(a0, b0, p), mulmod(2, t, p), p))
+            mstore(add(eqVal, 0x20), addmod(addmod(mulmod(a0, b1, p), mulmod(a1, b0, p), p), mulmod(2, mulmod(a2, b2, p), p), p))
+            mstore(add(eqVal, 0x40), addmod(addmod(mulmod(a0, b2, p), mulmod(a1, b1, p), p), mulmod(a2, b0, p), p))
+        }
+
+        require(GoldilocksExt3.eq(linearFormRlc, eqVal), "FinalClaim: linear form mismatch");
     }
 
     // =====================================================================
@@ -425,6 +492,103 @@ library SpongefishWhirVerify {
         if (i < hi) _quicksortWithHashes(idx, hsh, i, hi);
     }
 
+    /// @dev Add OOD + in-domain constraint values to theSum. Extracted to avoid stack-too-deep.
+    function _addOodAndInDomainToSum(
+        GoldilocksExt3.Ext3 memory theSum_,
+        GoldilocksExt3.Ext3[] memory roundOodAnswers,
+        GoldilocksExt3.Ext3[] memory roundRlc,
+        uint256 oodSamples,
+        GoldilocksExt3.Ext3[] memory eqW,
+        bytes memory hints,
+        uint256[] memory rowOffsets,
+        uint256 rawCount,
+        uint256 numCols,
+        bool isBaseField
+    ) private pure {
+        // OOD values
+        for (uint256 i = 0; i < oodSamples; i++) {
+            _mulAddToSum(theSum_, roundOodAnswers[i], roundRlc[i]);
+        }
+        // In-domain values
+        for (uint256 i = 0; i < rawCount; i++) {
+            GoldilocksExt3.Ext3 memory val = _dotEqWithRow(eqW, hints, rowOffsets[i], numCols, isBaseField);
+            _mulAddToSum(theSum_, val, roundRlc[oodSamples + i]);
+        }
+    }
+
+    /// @dev theSum += a * b (inline assembly, no intermediate allocs)
+    function _mulAddToSum(
+        GoldilocksExt3.Ext3 memory s,
+        GoldilocksExt3.Ext3 memory a,
+        GoldilocksExt3.Ext3 memory b
+    ) private pure {
+        assembly {
+            let p := 0xFFFFFFFF00000001
+            let a0 := mload(a)
+            let a1 := mload(add(a, 0x20))
+            let a2 := mload(add(a, 0x40))
+            let b0 := mload(b)
+            let b1 := mload(add(b, 0x20))
+            let b2 := mload(add(b, 0x40))
+            let t := addmod(mulmod(a1, b2, p), mulmod(a2, b1, p), p)
+            mstore(s, addmod(mload(s), addmod(mulmod(a0, b0, p), mulmod(2, t, p), p), p))
+            mstore(add(s, 0x20), addmod(mload(add(s, 0x20)), addmod(addmod(mulmod(a0, b1, p), mulmod(a1, b0, p), p), mulmod(2, mulmod(a2, b2, p), p), p), p))
+            mstore(add(s, 0x40), addmod(mload(add(s, 0x40)), addmod(addmod(mulmod(a0, b2, p), mulmod(a1, b1, p), p), mulmod(a2, b0, p), p), p))
+        }
+    }
+
+    /// @dev Accumulate theSum += Σ_i (dot(matrix[i*nv..(i+1)*nv], vectorRlc) * constraintRlc[rlcOff+i])
+    function _accumulateTheSum(
+        GoldilocksExt3.Ext3 memory theSum,
+        GoldilocksExt3.Ext3[] memory matrix,
+        GoldilocksExt3.Ext3[] memory vectorRlc,
+        GoldilocksExt3.Ext3[] memory constraintRlc,
+        uint256 rlcOffset,
+        uint256 count,
+        uint256 numVectors
+    ) private pure {
+        assembly {
+            let p := 0xFFFFFFFF00000001
+            let mData := add(matrix, 0x20)
+            let vData := add(vectorRlc, 0x20)
+            let cData := add(constraintRlc, 0x20)
+
+            for { let i := 0 } lt(i, count) { i := add(i, 1) } {
+                // dot = Σ_j matrix[i*nv+j] * vectorRlc[j]
+                let d0 := 0
+                let d1 := 0
+                let d2 := 0
+                for { let j := 0 } lt(j, numVectors) { j := add(j, 1) } {
+                    let mPtr := mload(add(mData, mul(add(mul(i, numVectors), j), 0x20)))
+                    let vPtr := mload(add(vData, mul(j, 0x20)))
+                    let a0 := mload(mPtr)
+                    let a1 := mload(add(mPtr, 0x20))
+                    let a2 := mload(add(mPtr, 0x40))
+                    let b0 := mload(vPtr)
+                    let b1 := mload(add(vPtr, 0x20))
+                    let b2 := mload(add(vPtr, 0x40))
+                    let t := addmod(mulmod(a1, b2, p), mulmod(a2, b1, p), p)
+                    d0 := addmod(d0, addmod(mulmod(a0, b0, p), mulmod(2, t, p), p), p)
+                    d1 := addmod(d1, addmod(addmod(mulmod(a0, b1, p), mulmod(a1, b0, p), p), mulmod(2, mulmod(a2, b2, p), p), p), p)
+                    d2 := addmod(d2, addmod(addmod(mulmod(a0, b2, p), mulmod(a1, b1, p), p), mulmod(a2, b0, p), p), p)
+                }
+                // term = dot * constraintRlc[rlcOffset + i]
+                let cPtr := mload(add(cData, mul(add(rlcOffset, i), 0x20)))
+                let c0 := mload(cPtr)
+                let c1 := mload(add(cPtr, 0x20))
+                let c2 := mload(add(cPtr, 0x40))
+                let tt := addmod(mulmod(d1, c2, p), mulmod(d2, c1, p), p)
+                let r0 := addmod(mulmod(d0, c0, p), mulmod(2, tt, p), p)
+                let r1 := addmod(addmod(mulmod(d0, c1, p), mulmod(d1, c0, p), p), mulmod(2, mulmod(d2, c2, p), p), p)
+                let r2 := addmod(addmod(mulmod(d0, c2, p), mulmod(d1, c1, p), p), mulmod(d2, c0, p), p)
+                // theSum += term
+                mstore(theSum, addmod(mload(theSum), r0, p))
+                mstore(add(theSum, 0x20), addmod(mload(add(theSum, 0x20)), r1, p))
+                mstore(add(theSum, 0x40), addmod(mload(add(theSum, 0x40)), r2, p))
+            }
+        }
+    }
+
     /// @dev keccak256 of a slice within a bytes buffer (zero-copy, no allocation).
     function _keccak256At(bytes memory buf, uint256 offset, uint256 len) private pure returns (bytes32 result) {
         assembly {
@@ -448,17 +612,19 @@ library SpongefishWhirVerify {
         }
     }
 
-    /// @dev Goldilocks modular exponentiation: base^exp mod GL_P
-    function _glPow(uint64 base, uint256 exp) private pure returns (uint64) {
-        uint256 result = 1;
-        uint256 b = uint256(base);
-        uint256 p = uint256(GL_P);
-        while (exp > 0) {
-            if (exp & 1 == 1) result = mulmod(result, b, p);
-            exp >>= 1;
-            b = mulmod(b, b, p);
+    /// @dev Goldilocks modular exponentiation: base^exp mod GL_P — full assembly
+    function _glPow(uint64 base, uint256 e) private pure returns (uint64 val) {
+        assembly {
+            let p := 0xFFFFFFFF00000001
+            let result := 1
+            let b := and(base, 0xFFFFFFFFFFFFFFFF)
+            for {} gt(e, 0) {} {
+                if and(e, 1) { result := mulmod(result, b, p) }
+                e := shr(1, e)
+                b := mulmod(b, b, p)
+            }
+            val := result
         }
-        return uint64(result);
     }
 
     struct OpenParams {
@@ -578,16 +744,9 @@ library SpongefishWhirVerify {
         uint256 constraintCount = params.roundOutDomainSamples + rawCount;
         GoldilocksExt3.Ext3[] memory roundRlc = SpongefishWhir.geometricChallenge(ts, constraintCount);
 
-        // Add OOD constraint values
-        for (uint256 i = 0; i < params.roundOutDomainSamples; i++) {
-            vs.theSum = vs.theSum.add(roundOodAnswers[i].mul(roundRlc[i]));
-        }
-
-        // Add in-domain constraint values (streaming: decode + dot in one pass)
-        for (uint256 i = 0; i < rawCount; i++) {
-            GoldilocksExt3.Ext3 memory val = _dotEqWithRow(eqW, hints, rowOffsets[i], numCols, isBaseField);
-            vs.theSum = vs.theSum.add(val.mul(roundRlc[params.roundOutDomainSamples + i]));
-        }
+        // Add OOD + in-domain constraint values to theSum
+        _addOodAndInDomainToSum(vs.theSum, roundOodAnswers, roundRlc, params.roundOutDomainSamples,
+            eqW, hints, rowOffsets, rawCount, numCols, isBaseField);
 
         // Build evaluation points for FinalClaim
         GoldilocksExt3.Ext3[] memory allEvalPoints = new GoldilocksExt3.Ext3[](constraintCount);

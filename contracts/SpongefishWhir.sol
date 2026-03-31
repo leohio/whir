@@ -339,23 +339,18 @@ library SpongefishWhir {
     /// @dev Copy a slice of a memory bytes array.
     function _memSlice(bytes memory data, uint256 offset, uint256 len) private pure returns (bytes memory result) {
         result = new bytes(len);
-        for (uint256 i = 0; i < len; i++) {
-            result[i] = data[offset + i];
+        assembly {
+            let src := add(add(data, 0x20), offset)
+            let dst := add(result, 0x20)
+            for { let i := 0 } lt(i, len) { i := add(i, 32) } {
+                mstore(add(dst, i), mload(add(src, i)))
+            }
         }
     }
 
     function _sortAndDedup(uint256[] memory arr) private pure {
         uint256 n = arr.length;
-        // Insertion sort
-        for (uint256 i = 1; i < n; i++) {
-            uint256 key = arr[i];
-            uint256 j = i;
-            while (j > 0 && arr[j - 1] > key) {
-                arr[j] = arr[j - 1];
-                j--;
-            }
-            arr[j] = key;
-        }
+        if (n > 1) _quicksort(arr, 0, n - 1);
         // Dedup
         if (n <= 1) return;
         uint256 write = 1;
@@ -365,5 +360,24 @@ library SpongefishWhir {
             }
         }
         assembly { mstore(arr, write) }
+    }
+
+    function _quicksort(uint256[] memory arr, uint256 lo, uint256 hi) private pure {
+        if (lo >= hi) return;
+        uint256 pivot = arr[(lo + hi) / 2];
+        uint256 i = lo;
+        uint256 j = hi;
+        while (i <= j) {
+            while (arr[i] < pivot) i++;
+            while (arr[j] > pivot) { if (j == 0) break; j--; }
+            if (i <= j) {
+                (arr[i], arr[j]) = (arr[j], arr[i]);
+                i++;
+                if (j == 0) break;
+                j--;
+            }
+        }
+        if (lo < j) _quicksort(arr, lo, j);
+        if (i < hi) _quicksort(arr, i, hi);
     }
 }

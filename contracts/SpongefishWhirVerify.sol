@@ -282,11 +282,11 @@ library SpongefishWhirVerify {
             : params.roundInDomainSamples;
         uint256[] memory rawFinalIndices = _challengeIndicesUnsorted(ts, finalCL, finalInDomainSamples);
 
-        SpongefishWhir.proverHint(ts, hints, 8);
+        ts.hintPos += 8; // skip Vec<T> length prefix (zero-copy)
         bytes32[] memory rawFinalHashes = new bytes32[](rawFinalIndices.length);
         for (uint256 i = 0; i < rawFinalIndices.length; i++) {
-            bytes memory rowData = SpongefishWhir.proverHint(ts, hints, finalRowBytes);
-            rawFinalHashes[i] = _keccak256Bytes(rowData);
+            rawFinalHashes[i] = _keccak256At(hints, ts.hintPos, finalRowBytes);
+            ts.hintPos += finalRowBytes;
         }
 
         (uint256[] memory sortedFinalIndices, bytes32[] memory sortedFinalHashes) =
@@ -400,20 +400,9 @@ library SpongefishWhirVerify {
     function _sortAndDedupWithHashes(
         uint256[] memory indices,
         bytes32[] memory hashes
-    ) private pure returns (uint256[] memory sortedIndices, bytes32[] memory sortedHashes) {
+    ) private pure returns (uint256[] memory, bytes32[] memory) {
         uint256 n = indices.length;
-        for (uint256 i = 1; i < n; i++) {
-            uint256 keyIdx = indices[i];
-            bytes32 keyHash = hashes[i];
-            uint256 j = i;
-            while (j > 0 && indices[j - 1] > keyIdx) {
-                indices[j] = indices[j - 1];
-                hashes[j] = hashes[j - 1];
-                j--;
-            }
-            indices[j] = keyIdx;
-            hashes[j] = keyHash;
-        }
+        if (n > 1) _quicksortWithHashes(indices, hashes, 0, n - 1);
         if (n <= 1) return (indices, hashes);
         uint256 write = 1;
         for (uint256 i = 1; i < n; i++) {
@@ -427,10 +416,88 @@ library SpongefishWhirVerify {
         return (indices, hashes);
     }
 
-    /// @dev keccak256 of bytes using SHA3 opcode directly.
-    function _keccak256Bytes(bytes memory data) private pure returns (bytes32 result) {
+    function _quicksortWithHashes(
+        uint256[] memory idx,
+        bytes32[] memory hsh,
+        uint256 lo,
+        uint256 hi
+    ) private pure {
+        if (lo >= hi) return;
+        uint256 pivot = idx[(lo + hi) / 2];
+        uint256 i = lo;
+        uint256 j = hi;
+        while (i <= j) {
+            while (idx[i] < pivot) i++;
+            while (idx[j] > pivot) { if (j == 0) break; j--; }
+            if (i <= j) {
+                (idx[i], idx[j]) = (idx[j], idx[i]);
+                (hsh[i], hsh[j]) = (hsh[j], hsh[i]);
+                i++;
+                if (j == 0) break;
+                j--;
+            }
+        }
+        if (lo < j) _quicksortWithHashes(idx, hsh, lo, j);
+        if (i < hi) _quicksortWithHashes(idx, hsh, i, hi);
+    }
+
+    /// @dev keccak256 of a slice within a bytes buffer (zero-copy, no allocation).
+    function _keccak256At(bytes memory buf, uint256 offset, uint256 len) private pure returns (bytes32 result) {
         assembly {
-            result := keccak256(add(data, 0x20), mload(data))
+            result := keccak256(add(add(buf, 0x20), offset), len)
+        }
+    }
+
+    /// @dev Read a u64 LE from a bytes buffer at a given offset (zero-copy).
+    function _readU64LEAt(bytes memory buf, uint256 baseOff, uint256 fieldOff) private pure returns (uint64) {
+        uint64 val;
+        assembly {
+            let ptr := add(add(buf, 0x20), add(baseOff, fieldOff))
+            // Read 8 bytes LE: load 32 bytes, mask lower 8
+            let word := mload(ptr)
+            // mload loads big-endian, but the data is LE in memory at ptr.
+            // Actually, memory is byte-addressable: ptr[0] is LSB of LE value.
+            // mload(ptr) reads bytes [ptr..ptr+31] as a big-endian uint256.
+            // So the byte at ptr is at bit position 248.
+            // To get LE u64: we need bytes ptr[0..8] in LE order.
+            val := or(
+                or(
+                    or(shl(0, and(shr(248, word), 0xFF)),
+                       shl(8, and(shr(240, word), 0xFF))),
+                    or(shl(16, and(shr(232, word), 0xFF)),
+                       shl(24, and(shr(224, word), 0xFF)))
+                ),
+                or(
+                    or(shl(32, and(shr(216, word), 0xFF)),
+                       shl(40, and(shr(208, word), 0xFF))),
+                    or(shl(48, and(shr(200, word), 0xFF)),
+                       shl(56, and(shr(192, word), 0xFF)))
+                )
+            )
+        }
+        return val;
+    }
+
+    /// @dev Decode a row from hints buffer at given offset (zero-copy).
+    function _decodeRowAt(
+        bytes memory hints,
+        uint256 rowOff,
+        uint256 numCols,
+        bool isBaseField
+    ) private pure returns (GoldilocksExt3.Ext3[] memory cols) {
+        cols = new GoldilocksExt3.Ext3[](numCols);
+        if (isBaseField) {
+            for (uint256 j = 0; j < numCols; j++) {
+                cols[j] = GoldilocksExt3.fromBase(_readU64LEAt(hints, rowOff, j * 8));
+            }
+        } else {
+            for (uint256 j = 0; j < numCols; j++) {
+                cols[j] = GoldilocksExt3.Ext3(
+                    _readU64LEAt(hints, rowOff, j * 24),
+                    _readU64LEAt(hints, rowOff, j * 24 + 8),
+                    _readU64LEAt(hints, rowOff, j * 24 + 16)
+                );
+            }
         }
     }
 
@@ -497,15 +564,16 @@ library SpongefishWhirVerify {
         uint256[] memory rawIndices = _challengeIndicesUnsorted(ts, o.cl, o.inDomainSamples);
         uint256 rawCount = rawIndices.length;
 
-        SpongefishWhir.proverHint(ts, hints, 8);
+        ts.hintPos += 8; // skip Vec<T> length prefix (zero-copy)
 
         bytes32[] memory rawLeafHashes = new bytes32[](rawCount);
         GoldilocksExt3.Ext3[][] memory decodedRows = new GoldilocksExt3.Ext3[][](rawCount);
 
         for (uint256 i = 0; i < rawCount; i++) {
-            bytes memory rowData = SpongefishWhir.proverHint(ts, hints, o.rowBytes);
-            rawLeafHashes[i] = _keccak256Bytes(rowData);
-            decodedRows[i] = _decodeRow(rowData, o.numCols, o.isBaseField);
+            uint256 rowOff = ts.hintPos;
+            rawLeafHashes[i] = _keccak256At(hints, rowOff, o.rowBytes);
+            decodedRows[i] = _decodeRowAt(hints, rowOff, o.numCols, o.isBaseField);
+            ts.hintPos += o.rowBytes;
         }
 
         GoldilocksExt3.Ext3[] memory inDomainEvalPoints = _computeEvalPoints(

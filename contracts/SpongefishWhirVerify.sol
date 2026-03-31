@@ -433,33 +433,19 @@ library SpongefishWhirVerify {
     }
 
     /// @dev Read a u64 LE from a bytes buffer at a given offset (zero-copy).
-    function _readU64LEAt(bytes memory buf, uint256 baseOff, uint256 fieldOff) private pure returns (uint64) {
-        uint64 val;
+    ///      Uses efficient byte-swap: load BE word, extract top 8 bytes, reverse.
+    function _readU64LEAt(bytes memory buf, uint256 baseOff, uint256 fieldOff) private pure returns (uint64 val) {
         assembly {
             let ptr := add(add(buf, 0x20), add(baseOff, fieldOff))
-            // Read 8 bytes LE: load 32 bytes, mask lower 8
-            let word := mload(ptr)
-            // mload loads big-endian, but the data is LE in memory at ptr.
-            // Actually, memory is byte-addressable: ptr[0] is LSB of LE value.
-            // mload(ptr) reads bytes [ptr..ptr+31] as a big-endian uint256.
-            // So the byte at ptr is at bit position 248.
-            // To get LE u64: we need bytes ptr[0..8] in LE order.
-            val := or(
-                or(
-                    or(shl(0, and(shr(248, word), 0xFF)),
-                       shl(8, and(shr(240, word), 0xFF))),
-                    or(shl(16, and(shr(232, word), 0xFF)),
-                       shl(24, and(shr(224, word), 0xFF)))
-                ),
-                or(
-                    or(shl(32, and(shr(216, word), 0xFF)),
-                       shl(40, and(shr(208, word), 0xFF))),
-                    or(shl(48, and(shr(200, word), 0xFF)),
-                       shl(56, and(shr(192, word), 0xFF)))
-                )
-            )
+            let w := shr(192, mload(ptr)) // top 8 bytes as BE u64
+
+            // Byte-swap 64-bit BE → LE using parallel swap
+            // Swap bytes in pairs of 1, then 2, then 4
+            w := or(and(shr(8, w), 0x00FF00FF00FF00FF), and(shl(8, w), 0xFF00FF00FF00FF00))
+            w := or(and(shr(16, w), 0x0000FFFF0000FFFF), and(shl(16, w), 0xFFFF0000FFFF0000))
+            w := or(shr(32, w), shl(32, w))
+            val := and(w, 0xFFFFFFFFFFFFFFFF)
         }
-        return val;
     }
 
     /// @dev Goldilocks modular exponentiation: base^exp mod GL_P
@@ -621,31 +607,72 @@ library SpongefishWhirVerify {
 
     /// @dev Evaluate dot(eq_weights(r), vector) by in-place folding (no eqWeights alloc).
     ///      Fold in REVERSE order: last randomness first (matching eqWeights bit convention).
-    ///      eqWeights[i] = ⊗_j (bit_j(i) ? r_j : 1-r_j) where j=0 is LSB.
-    ///      So folding pairs by MSB (last r) first preserves the correct dot product.
-    ///      Mutates `vec` in place.
+    ///      Mutates `vec` in place. Full assembly.
     function _foldEval(
         GoldilocksExt3.Ext3[] memory vec,
         GoldilocksExt3.Ext3[] memory randomness,
         uint256 rStart,
         uint256 numRounds
-    ) private pure returns (GoldilocksExt3.Ext3 memory) {
-        uint256 size = vec.length;
-        GoldilocksExt3.Ext3 memory one_ = GoldilocksExt3.one();
-        for (uint256 round = numRounds; round > 0; round--) {
-            GoldilocksExt3.Ext3 memory r = randomness[rStart + round - 1];
-            GoldilocksExt3.Ext3 memory oneMinusR = one_.sub(r);
-            uint256 half = size >> 1;
-            for (uint256 i = 0; i < half; i++) {
-                // vec[i] = vec[2i] * (1-r) + vec[2i+1] * r
-                vec[i] = vec[2 * i].mul(oneMinusR).add(vec[2 * i + 1].mul(r));
+    ) private pure returns (GoldilocksExt3.Ext3 memory result) {
+        assembly {
+            let p := 0xFFFFFFFF00000001
+            let size := mload(vec)
+            let vecData := add(vec, 0x20)   // pointer to array of Ext3 pointers
+            let rData := add(randomness, 0x20)
+
+            for { let round := numRounds } gt(round, 0) { round := sub(round, 1) } {
+                let rPtr := mload(add(rData, mul(add(rStart, sub(round, 1)), 0x20)))
+                let rr0 := mload(rPtr)
+                let rr1 := mload(add(rPtr, 0x20))
+                let rr2 := mload(add(rPtr, 0x40))
+                // oneMinusR
+                let omr0 := addmod(1, sub(p, rr0), p)
+                let omr1 := sub(p, rr1)  // 0 - r1 mod p
+                let omr2 := sub(p, rr2)
+
+                let half := shr(1, size)
+                for { let i := 0 } lt(i, half) { i := add(i, 1) } {
+                    let evenPtr := mload(add(vecData, mul(mul(i, 2), 0x20)))
+                    let oddPtr := mload(add(vecData, mul(add(mul(i, 2), 1), 0x20)))
+
+                    let e0 := mload(evenPtr)
+                    let e1 := mload(add(evenPtr, 0x20))
+                    let e2 := mload(add(evenPtr, 0x40))
+                    let o0 := mload(oddPtr)
+                    let o1 := mload(add(oddPtr, 0x20))
+                    let o2 := mload(add(oddPtr, 0x40))
+
+                    // even * oneMinusR (Ext3 mul)
+                    let t1a := addmod(mulmod(e1, omr2, p), mulmod(e2, omr1, p), p)
+                    let em0 := addmod(mulmod(e0, omr0, p), mulmod(2, t1a, p), p)
+                    let em1 := addmod(addmod(mulmod(e0, omr1, p), mulmod(e1, omr0, p), p), mulmod(2, mulmod(e2, omr2, p), p), p)
+                    let em2 := addmod(addmod(mulmod(e0, omr2, p), mulmod(e1, omr1, p), p), mulmod(e2, omr0, p), p)
+
+                    // odd * r (Ext3 mul)
+                    let t1b := addmod(mulmod(o1, rr2, p), mulmod(o2, rr1, p), p)
+                    let om0 := addmod(mulmod(o0, rr0, p), mulmod(2, t1b, p), p)
+                    let om1 := addmod(addmod(mulmod(o0, rr1, p), mulmod(o1, rr0, p), p), mulmod(2, mulmod(o2, rr2, p), p), p)
+                    let om2 := addmod(addmod(mulmod(o0, rr2, p), mulmod(o1, rr1, p), p), mulmod(o2, rr0, p), p)
+
+                    // Store result into vec[i]'s memory (reuse evenPtr)
+                    let destPtr := mload(add(vecData, mul(i, 0x20)))
+                    mstore(destPtr, addmod(em0, om0, p))
+                    mstore(add(destPtr, 0x20), addmod(em1, om1, p))
+                    mstore(add(destPtr, 0x40), addmod(em2, om2, p))
+                }
+                size := half
             }
-            size = half;
+
+            // result = vec[0]
+            let v0Ptr := mload(vecData)
+            mstore(result, mload(v0Ptr))
+            mstore(add(result, 0x20), mload(add(v0Ptr, 0x20)))
+            mstore(add(result, 0x40), mload(add(v0Ptr, 0x40)))
         }
-        return vec[0];
     }
 
     /// @dev Compute dot(eqW, row) by reading row fields directly from hints (no row alloc).
+    ///      Full assembly: reads LE u64 fields from hints, accumulates mul+add on stack.
     function _dotEqWithRow(
         GoldilocksExt3.Ext3[] memory eqW,
         bytes memory hints,
@@ -653,21 +680,83 @@ library SpongefishWhirVerify {
         uint256 numCols,
         bool isBaseField
     ) private pure returns (GoldilocksExt3.Ext3 memory acc) {
-        acc = GoldilocksExt3.zero();
-        if (isBaseField) {
-            for (uint256 j = 0; j < numCols; j++) {
-                uint64 v = _readU64LEAt(hints, rowOff, j * 8);
-                acc = acc.add(eqW[j].mulScalar(v));
+        assembly {
+            let p := 0xFFFFFFFF00000001
+            let r0 := 0
+            let r1 := 0
+            let r2 := 0
+            let eqPtr := add(eqW, 0x20) // pointer to first element pointer
+            let base := add(add(hints, 0x20), rowOff)
+
+            // Helper: byte-swap 64-bit BE→LE inline (repeated via copy)
+            // We use a function-like macro via code duplication
+
+            for { let j := 0 } lt(j, numCols) { j := add(j, 1) } {
+                let eqElem := mload(add(eqPtr, mul(j, 0x20)))
+                let w0 := mload(eqElem)
+                let w1 := mload(add(eqElem, 0x20))
+                let w2 := mload(add(eqElem, 0x40))
+
+                // Read field element(s) from hints
+                let b0 := 0
+                let b1 := 0
+                let b2 := 0
+
+                switch isBaseField
+                case 1 {
+                    // Base field: 1 u64 LE → (val, 0, 0)
+                    let raw := shr(192, mload(add(base, mul(j, 8))))
+                    raw := or(and(shr(8, raw), 0x00FF00FF00FF00FF), and(shl(8, raw), 0xFF00FF00FF00FF00))
+                    raw := or(and(shr(16, raw), 0x0000FFFF0000FFFF), and(shl(16, raw), 0xFFFF0000FFFF0000))
+                    raw := or(shr(32, raw), shl(32, raw))
+                    b0 := and(raw, 0xFFFFFFFFFFFFFFFF)
+                    // b1, b2 stay 0
+
+                    // mulScalar: result = (w0*b0, w1*b0, w2*b0) mod p
+                    r0 := addmod(r0, mulmod(w0, b0, p), p)
+                    r1 := addmod(r1, mulmod(w1, b0, p), p)
+                    r2 := addmod(r2, mulmod(w2, b0, p), p)
+                }
+                default {
+                    // Ext3: 3 u64 LE
+                    let off := mul(j, 24)
+
+                    let raw0 := shr(192, mload(add(base, off)))
+                    raw0 := or(and(shr(8, raw0), 0x00FF00FF00FF00FF), and(shl(8, raw0), 0xFF00FF00FF00FF00))
+                    raw0 := or(and(shr(16, raw0), 0x0000FFFF0000FFFF), and(shl(16, raw0), 0xFFFF0000FFFF0000))
+                    raw0 := or(shr(32, raw0), shl(32, raw0))
+                    b0 := and(raw0, 0xFFFFFFFFFFFFFFFF)
+
+                    let raw1 := shr(192, mload(add(base, add(off, 8))))
+                    raw1 := or(and(shr(8, raw1), 0x00FF00FF00FF00FF), and(shl(8, raw1), 0xFF00FF00FF00FF00))
+                    raw1 := or(and(shr(16, raw1), 0x0000FFFF0000FFFF), and(shl(16, raw1), 0xFFFF0000FFFF0000))
+                    raw1 := or(shr(32, raw1), shl(32, raw1))
+                    b1 := and(raw1, 0xFFFFFFFFFFFFFFFF)
+
+                    let raw2 := shr(192, mload(add(base, add(off, 16))))
+                    raw2 := or(and(shr(8, raw2), 0x00FF00FF00FF00FF), and(shl(8, raw2), 0xFF00FF00FF00FF00))
+                    raw2 := or(and(shr(16, raw2), 0x0000FFFF0000FFFF), and(shl(16, raw2), 0xFFFF0000FFFF0000))
+                    raw2 := or(shr(32, raw2), shl(32, raw2))
+                    b2 := and(raw2, 0xFFFFFFFFFFFFFFFF)
+
+                    // Ext3 mul: eqW[j] * col
+                    // mc0 = w0*b0 + 2*(w1*b2 + w2*b1)
+                    let t1 := addmod(mulmod(w1, b2, p), mulmod(w2, b1, p), p)
+                    let mc0 := addmod(mulmod(w0, b0, p), mulmod(2, t1, p), p)
+                    // mc1 = w0*b1 + w1*b0 + 2*w2*b2
+                    let mc1 := addmod(addmod(mulmod(w0, b1, p), mulmod(w1, b0, p), p), mulmod(2, mulmod(w2, b2, p), p), p)
+                    // mc2 = w0*b2 + w1*b1 + w2*b0
+                    let mc2 := addmod(addmod(mulmod(w0, b2, p), mulmod(w1, b1, p), p), mulmod(w2, b0, p), p)
+
+                    r0 := addmod(r0, mc0, p)
+                    r1 := addmod(r1, mc1, p)
+                    r2 := addmod(r2, mc2, p)
+                }
             }
-        } else {
-            for (uint256 j = 0; j < numCols; j++) {
-                GoldilocksExt3.Ext3 memory col = GoldilocksExt3.Ext3(
-                    _readU64LEAt(hints, rowOff, j * 24),
-                    _readU64LEAt(hints, rowOff, j * 24 + 8),
-                    _readU64LEAt(hints, rowOff, j * 24 + 16)
-                );
-                acc = acc.add(eqW[j].mul(col));
-            }
+
+            mstore(acc, r0)
+            mstore(add(acc, 0x20), r1)
+            mstore(add(acc, 0x40), r2)
         }
     }
 

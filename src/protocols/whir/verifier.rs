@@ -257,4 +257,210 @@ where
             linear_form_rlc,
         })
     }
+
+    /// Verify a proof generated with split witnesses (per-vector commitments).
+    ///
+    /// Each commitment covers a single vector (created via `commit_split`).
+    /// The verifier uses a `num_vectors=1` config for initial opening/verify.
+    #[allow(clippy::too_many_lines)]
+    #[cfg_attr(feature = "tracing", instrument(skip_all, name = "whir::verify_split"))]
+    pub fn verify_split<H>(
+        &self,
+        verifier_state: &mut VerifierState<'_, H>,
+        commitments: &[&Commitment<M::Target>],
+        evaluations: &[M::Target],
+    ) -> VerificationResult<FinalClaim<M::Target>>
+    where
+        H: DuplexSpongeInterface,
+        M::Target: Codec<[H::U]>,
+        u8: Decoding<[H::U]>,
+        [u8; 32]: Decoding<[H::U]>,
+        U64: Codec<[H::U]>,
+        Hash: ProverMessage<[H::U]>,
+    {
+        // Each commitment covers 1 vector (from single_vector_committer).
+        let num_vectors = commitments.len();
+        verify!(evaluations.len().is_multiple_of(num_vectors));
+        let num_linear_forms = evaluations.len() / num_vectors;
+        if num_vectors == 0 {
+            return Ok(FinalClaim::default());
+        }
+
+        let single_config = self.single_vector_committer();
+
+        // Complete the constraint and evaluation matrix with OODs and their cross-terms.
+        let (oods_evals, oods_matrix) = {
+            let mut oods_evals = Vec::new();
+            let mut oods_matrix = Vec::new();
+
+            let mut vector_offset = 0;
+            for commitment in commitments {
+                for (weights, oods_row) in zip_strict(
+                    commitment.out_of_domain().evaluators(self.initial_size()),
+                    commitment.out_of_domain().rows(),
+                ) {
+                    for j in 0..num_vectors {
+                        if j >= vector_offset && j < oods_row.len() + vector_offset {
+                            oods_matrix.push(oods_row[j - vector_offset]);
+                        } else {
+                            oods_matrix.push(verifier_state.prover_message()?);
+                        }
+                    }
+                    oods_evals.push(weights);
+                }
+                vector_offset += commitment.num_vectors();
+            }
+            (oods_evals, oods_matrix)
+        };
+
+        // Random linear combination of the vectors.
+        let vector_rlc_coeffs = geometric_challenge(verifier_state, num_vectors);
+        let batching_weights = vector_rlc_coeffs.clone();
+        let mut prev_is_split_initial = true;
+
+        // Random linear combination of the constraints.
+        let constraint_rlc_coeffs: Vec<M::Target> =
+            geometric_challenge(verifier_state, oods_evals.len() + num_linear_forms);
+        let (initial_form_rlc_coeffs, oods_rlc_coeffs) =
+            constraint_rlc_coeffs.split_at(num_linear_forms);
+
+        // Compute "The Sum"
+        let mut the_sum = zip_strict(
+            initial_form_rlc_coeffs,
+            evaluations.chunks_exact(num_vectors),
+        )
+        .map(|(poly_coeff, row)| *poly_coeff * dot(&vector_rlc_coeffs, row))
+        .sum::<M::Target>();
+        the_sum += zip_strict(oods_rlc_coeffs, oods_matrix.chunks_exact(num_vectors))
+            .map(|(poly_coeff, row)| *poly_coeff * dot(&vector_rlc_coeffs, row))
+            .sum::<M::Target>();
+        let mut round_constraints = vec![(oods_rlc_coeffs.to_vec(), oods_evals)];
+
+        let mut round_folding_randomness = Vec::new();
+
+        // Run initial sumcheck on batched vector with combined statement
+        let folding_randomness = if constraint_rlc_coeffs.is_empty() {
+            assert_eq!(the_sum, M::Target::ZERO);
+            let folding_randomness =
+                verifier_state.verifier_message_vec(self.initial_sumcheck.num_rounds);
+            self.initial_skip_pow.verify(verifier_state)?;
+            MultilinearPoint(folding_randomness)
+        } else {
+            self.initial_sumcheck.verify(verifier_state, &mut the_sum)?
+        };
+        round_folding_randomness.push(folding_randomness);
+
+        // Track previous round commitment for non-initial rounds.
+        let mut prev_round_commitment: Option<irs_commit::Commitment<M::Target>> = None;
+
+        for (round_index, round_config) in self.round_configs.iter().enumerate() {
+            let commitment = round_config
+                .irs_committer
+                .receive_commitment(verifier_state)?;
+
+            round_config.pow.verify(verifier_state)?;
+
+            // Open the previous round's commitment.
+            let (in_domain, poly_rlc) = if prev_is_split_initial {
+                prev_is_split_initial = false;
+                let in_domain = single_config.verify(verifier_state, commitments)?;
+                (in_domain.lift(self.embedding()), batching_weights.clone())
+            } else {
+                let prev_commitment = prev_round_commitment
+                    .take()
+                    .expect("non-initial round must have previous commitment");
+                let prev_round_config = &self.round_configs[round_index - 1];
+                let in_domain = prev_round_config
+                    .irs_committer
+                    .verify(verifier_state, &[&prev_commitment])?;
+                (in_domain, vec![M::Target::ONE])
+            };
+
+            // Random linear combination of out- and in-domain constraints
+            let constraint_weights = commitment
+                .out_of_domain()
+                .evaluators(round_config.initial_size())
+                .chain(in_domain.evaluators(round_config.initial_size()))
+                .collect::<Vec<_>>();
+            let constraint_values = commitment
+                .out_of_domain()
+                .values(&[M::Target::ONE])
+                .chain(in_domain.values(&tensor_product(
+                    &poly_rlc,
+                    &round_folding_randomness.last().unwrap().eq_weights(),
+                )))
+                .collect::<Vec<_>>();
+            let constraint_rlc_coeffs =
+                geometric_challenge(verifier_state, constraint_values.len());
+            the_sum += dot(&constraint_rlc_coeffs, &constraint_values);
+            round_constraints.push((constraint_rlc_coeffs, constraint_weights));
+
+            let folding_randomness = round_config.sumcheck.verify(verifier_state, &mut the_sum)?;
+            round_folding_randomness.push(folding_randomness);
+
+            prev_round_commitment = Some(commitment);
+        }
+
+        // Final round (we receive the full vector instead of a commitment)
+        let final_vector = verifier_state.prover_messages_vec(self.final_sumcheck.initial_size)?;
+
+        // Final proof of work.
+        self.final_pow.verify(verifier_state)?;
+
+        // Open previous witness, as usual
+        let (in_domain, poly_rlc) = if prev_is_split_initial {
+            let in_domain = single_config.verify(verifier_state, commitments)?;
+            (in_domain.lift(self.embedding()), batching_weights)
+        } else {
+            let prev_commitment = prev_round_commitment
+                .take()
+                .expect("must have previous commitment");
+            let prev_round_config = &self.round_configs.last().unwrap();
+            let in_domain = prev_round_config
+                .irs_committer
+                .verify(verifier_state, &[&prev_commitment])?;
+            (in_domain, vec![M::Target::ONE])
+        };
+
+        // Verify in-domain constraints directly
+        for (weights, evals) in zip_strict(
+            in_domain.evaluators(final_vector.len()),
+            in_domain.values(&tensor_product(
+                &poly_rlc,
+                &round_folding_randomness.last().unwrap().eq_weights(),
+            )),
+        ) {
+            verify!(weights.evaluate(&Identity::<M::Target>::new(), &final_vector) == evals);
+        }
+
+        // Final sumcheck
+        let final_sumcheck_randomness = self.final_sumcheck.verify(verifier_state, &mut the_sum)?;
+        round_folding_randomness.push(final_sumcheck_randomness.clone());
+
+        let evaluation_point = round_folding_randomness
+            .into_iter()
+            .flat_map(|poly| poly.0.into_iter())
+            .collect::<Vec<_>>();
+
+        let poly_eval = MultilinearExtension::new(final_sumcheck_randomness.0)
+            .evaluate(&Identity::new(), &final_vector);
+        let mut linear_form_rlc = the_sum / poly_eval;
+
+        for (round, (weights_rlc_coeffs, weights)) in round_constraints.into_iter().enumerate() {
+            let num_variables = round.checked_sub(1).map_or_else(
+                || self.initial_num_variables(),
+                |p| self.round_configs[p].initial_num_variables(),
+            );
+            let start = evaluation_point.len().saturating_sub(num_variables);
+            for (rlc_coeff, weights) in zip_strict(weights_rlc_coeffs, weights) {
+                linear_form_rlc -= rlc_coeff * weights.mle_evaluate(&evaluation_point[start..]);
+            }
+        }
+
+        Ok(FinalClaim {
+            evaluation_point,
+            rlc_coefficients: initial_form_rlc_coeffs.to_vec(),
+            linear_form_rlc,
+        })
+    }
 }

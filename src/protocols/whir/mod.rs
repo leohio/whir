@@ -18,7 +18,7 @@ use crate::{
         linear_form::LinearForm,
     },
     hash::Hash,
-    protocols::{irs_commit, proof_of_work, sumcheck},
+    protocols::{irs_commit, matrix_commit, proof_of_work, sumcheck},
     transcript::{
         Codec, DuplexSpongeInterface, ProverMessage, ProverState, VerificationResult, VerifierState,
     },
@@ -55,6 +55,18 @@ where
 
 pub type Witness<F: FftField, M: Embedding<Target = F>> = irs_commit::Witness<M::Source, F>;
 pub type Commitment<F: Field> = irs_commit::Commitment<F>;
+
+/// Witness for split-commit mode (one IRS witness per vector).
+#[derive(Debug, Clone)]
+pub struct SplitWitness<F: FftField, M: Embedding<Target = F>>
+where
+    M::Source: FftField,
+{
+    /// Per-vector witnesses from individual `irs_commit::commit()` calls.
+    pub witnesses: Vec<irs_commit::Witness<M::Source, F>>,
+    /// Per-vector Merkle root hashes.
+    pub roots: Vec<Hash>,
+}
 
 #[must_use = "The final claim must be checked if there where any linear forms."]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -115,6 +127,79 @@ where
         Hash: ProverMessage<[H::U]>,
     {
         self.initial_committer.receive_commitment(verifier_state)
+    }
+
+    /// Create an `irs_commit::Config` with `num_vectors=1`, derived from
+    /// the initial committer. Used by split-commit methods.
+    pub fn single_vector_committer(&self) -> irs_commit::Config<M> {
+        let base = &self.initial_committer;
+        irs_commit::Config {
+            embedding: base.embedding.clone(),
+            num_vectors: 1,
+            vector_size: base.vector_size,
+            mask_length: base.mask_length,
+            codeword_length: base.codeword_length,
+            interleaving_depth: base.interleaving_depth,
+            matrix_commit: matrix_commit::Config::with_hash(
+                base.matrix_commit.leaf_hash_id,
+                base.codeword_length,
+                base.interleaving_depth, // was interleaving_depth * num_vectors
+            ),
+            johnson_slack: base.johnson_slack,
+            in_domain_samples: base.in_domain_samples,
+            out_domain_samples: base.out_domain_samples,
+            deduplicate_in_domain: base.deduplicate_in_domain,
+        }
+    }
+
+    /// Commit to each vector individually, returning per-vector roots.
+    ///
+    /// Unlike `commit()` which interleaves all vectors into one matrix,
+    /// this commits each vector separately using `num_vectors=1`. This
+    /// allows extracting individual commitment roots (e.g., for VK binding).
+    ///
+    /// The WHIR `prove_split()` step will RLC-combine the separate commitments.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, fields(num_vectors = vectors.len())))]
+    pub fn commit_split<H, R>(
+        &self,
+        prover_state: &mut ProverState<H, R>,
+        vectors: &[&[M::Source]],
+    ) -> SplitWitness<M::Target, M>
+    where
+        Standard: Distribution<M::Source>,
+        H: DuplexSpongeInterface,
+        R: RngCore + CryptoRng,
+        M::Target: Codec<[H::U]>,
+        Hash: ProverMessage<[H::U]>,
+    {
+        let single_config = self.single_vector_committer();
+        let mut witnesses = Vec::with_capacity(vectors.len());
+        let mut roots = Vec::with_capacity(vectors.len());
+        for &vector in vectors {
+            let witness = single_config.commit(prover_state, &[vector]);
+            roots.push(witness.matrix_witness.root());
+            witnesses.push(witness);
+        }
+        SplitWitness { witnesses, roots }
+    }
+
+    /// Receive individually committed vectors (verifier side).
+    pub fn receive_split_commitment<H>(
+        &self,
+        verifier_state: &mut VerifierState<H>,
+        num_vectors: usize,
+    ) -> VerificationResult<Vec<Commitment<M::Target>>>
+    where
+        H: DuplexSpongeInterface,
+        M::Target: Codec<[H::U]>,
+        Hash: ProverMessage<[H::U]>,
+    {
+        let single_config = self.single_vector_committer();
+        let mut commitments = Vec::with_capacity(num_vectors);
+        for _ in 0..num_vectors {
+            commitments.push(single_config.receive_commitment(verifier_state)?);
+        }
+        Ok(commitments)
     }
 
     /// Disable proof-of-work for test.
@@ -917,5 +1002,250 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- Split-commit tests ----
+
+    /// Test split-commit: commit each vector individually, prove with RLC, verify.
+    fn make_whir_split_things(
+        num_variables: usize,
+        initial_folding_factor: usize,
+        folding_factor: usize,
+        num_points_per_poly: usize,
+        num_vectors: usize,
+        unique_decoding: bool,
+        pow_bits: usize,
+    ) {
+        let num_coeffs = 1 << num_variables;
+        let mut rng = ark_std::test_rng();
+
+        let whir_params = ProtocolParameters {
+            security_level: 32,
+            pow_bits,
+            initial_folding_factor,
+            folding_factor,
+            unique_decoding,
+            starting_log_inv_rate: 1,
+            batch_size: 1, // split mode always uses batch_size=1 per vector
+            hash_id: hash::SHA2,
+        };
+
+        let mut params = Config::<Basefield<EF>>::new(1 << num_variables, &whir_params);
+        params.disable_pow();
+
+        // Create N different vectors
+        let vectors: Vec<Vec<F>> = (0..num_vectors)
+            .map(|i| vec![F::from((i + 1) as u64); num_coeffs])
+            .collect();
+        let vec_refs = vectors.iter().map(|v| v.as_slice()).collect::<Vec<_>>();
+
+        let points: Vec<_> = (0..num_points_per_poly)
+            .map(|_| MultilinearPoint::rand(&mut rng, num_variables))
+            .collect();
+
+        let mut linear_forms: Vec<Box<dyn Evaluate<Basefield<EF>>>> = Vec::new();
+        for point in &points {
+            linear_forms.push(Box::new(MultilinearExtension {
+                point: point.0.clone(),
+            }));
+        }
+        linear_forms.push(Box::new(Covector {
+            vector: (0..1 << num_variables).map(EF::from).collect(),
+        }));
+
+        let evaluations = linear_forms
+            .iter()
+            .flat_map(|linear_form| {
+                vec_refs
+                    .iter()
+                    .map(|vec| linear_form.evaluate(params.embedding(), vec))
+            })
+            .collect::<Vec<_>>();
+
+        // Set up domain separator
+        let ds = DomainSeparator::protocol(&params)
+            .session(&format!("Test at {}:{}", file!(), line!()))
+            .instance(&Empty);
+        let mut prover_state = ProverState::new_std(&ds);
+
+        // Split-commit: each vector gets its own Merkle tree
+        let split_witness = params.commit_split(&mut prover_state, &vec_refs);
+
+        // Verify we got per-vector roots
+        assert_eq!(split_witness.roots.len(), num_vectors);
+        assert_eq!(split_witness.witnesses.len(), num_vectors);
+        // Roots should be distinct for different vectors (with overwhelming probability)
+        if num_vectors > 1 {
+            for i in 0..num_vectors {
+                for j in (i + 1)..num_vectors {
+                    assert_ne!(split_witness.roots[i], split_witness.roots[j]);
+                }
+            }
+        }
+
+        let prove_linear_forms = build_prove_forms(&points, num_variables, true);
+
+        // Prove with split witnesses
+        let _ = params.prove_split(
+            &mut prover_state,
+            vectors
+                .iter()
+                .map(|v| Cow::Borrowed(v.as_slice()))
+                .collect(),
+            split_witness,
+            prove_linear_forms,
+            Cow::Borrowed(evaluations.as_slice()),
+        );
+
+        // Verify
+        let proof = prover_state.proof();
+        let mut verifier_state = VerifierState::new_std(&ds, &proof);
+
+        let commitments = params
+            .receive_split_commitment(&mut verifier_state, num_vectors)
+            .unwrap();
+        let commitment_refs = commitments.iter().collect::<Vec<_>>();
+
+        let final_claim = params
+            .verify_split(&mut verifier_state, &commitment_refs, &evaluations)
+            .unwrap();
+        final_claim
+            .verify(
+                linear_forms
+                    .iter()
+                    .map(|l| l.as_ref() as &dyn LinearForm<EF>),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_whir_split_1() {
+        let folding_factors = [2, 3];
+        let num_vectors_list = [1, 2, 3];
+        let num_points = [0, 1, 2];
+
+        for folding_factor in folding_factors {
+            for num_variables in (2 * folding_factor)..=(3 * folding_factor) {
+                for num_vecs in num_vectors_list {
+                    for num_pts in num_points {
+                        eprintln!();
+                        dbg!(folding_factor, num_variables, num_vecs, num_pts);
+                        make_whir_split_things(
+                            num_variables,
+                            folding_factor,
+                            folding_factor,
+                            num_pts,
+                            num_vecs,
+                            false,
+                            0,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_whir_split_unique_decoding() {
+        make_whir_split_things(6, 2, 2, 1, 2, true, 0);
+    }
+
+    #[test]
+    fn test_whir_split_single_vector() {
+        // Edge case: split with just 1 vector should work
+        make_whir_split_things(4, 2, 2, 2, 1, false, 0);
+    }
+
+    /// Test that split verification rejects proofs with mismatched polynomials.
+    #[test]
+    #[cfg_attr(feature = "verifier_panics", should_panic)]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "debug_assert in prover panics on intentionally invalid input"
+    )]
+    fn test_whir_split_rejects_invalid_constraint() {
+        let num_variables = 4;
+        let num_coeffs = 1 << num_variables;
+        let mut rng = ark_std::test_rng();
+
+        let whir_params = ProtocolParameters {
+            security_level: 32,
+            pow_bits: 0,
+            initial_folding_factor: 2,
+            folding_factor: 2,
+            unique_decoding: false,
+            starting_log_inv_rate: 1,
+            batch_size: 1,
+            hash_id: hash::SHA2,
+        };
+
+        let mut params = Config::<Basefield<EF>>::new(1 << num_variables, &whir_params);
+        params.disable_pow();
+
+        let vec1 = vec![F::ONE; num_coeffs];
+        let vec2 = vec![F::from(2u64); num_coeffs];
+        let vec_wrong = vec![F::from(999u64); num_coeffs];
+
+        let constraint_points: Vec<_> = (0..2)
+            .map(|_| MultilinearPoint::rand(&mut rng, num_variables))
+            .collect();
+
+        let linear_forms: [Box<dyn Evaluate<Basefield<EF>>>; 2] = [
+            Box::new(MultilinearExtension {
+                point: constraint_points[0].0.clone(),
+            }),
+            Box::new(MultilinearExtension {
+                point: constraint_points[1].0.clone(),
+            }),
+        ];
+        // Evaluations computed with vec_wrong instead of vec2
+        let evaluations = linear_forms
+            .iter()
+            .flat_map(|weights| {
+                [&vec1, &vec_wrong].map(|v| weights.evaluate(params.embedding(), v))
+            })
+            .collect::<Vec<_>>();
+
+        let ds = DomainSeparator::protocol(&params)
+            .session(&format!("Test at {}:{}", file!(), line!()))
+            .instance(&Empty);
+        let mut prover_state = ProverState::new_std(&ds);
+
+        // Commit to vec1 and vec2 (but prove with vec_wrong for vec2)
+        let split_witness = params.commit_split(&mut prover_state, &[&vec1, &vec2]);
+
+        let prove_linear_forms = build_prove_forms(&constraint_points, num_variables, false);
+
+        let _ = params.prove_split(
+            &mut prover_state,
+            vec![Cow::Borrowed(vec1.as_slice()), Cow::from(vec_wrong)],
+            split_witness,
+            prove_linear_forms,
+            Cow::Borrowed(evaluations.as_slice()),
+        );
+
+        let proof = prover_state.proof();
+        let mut verifier_state = VerifierState::new_std(&ds, &proof);
+
+        let commitments = params
+            .receive_split_commitment(&mut verifier_state, 2)
+            .unwrap();
+
+        let final_claim = params
+            .verify_split(
+                &mut verifier_state,
+                &[&commitments[0], &commitments[1]],
+                &evaluations,
+            )
+            .unwrap();
+        let verifier_result = final_claim.verify(
+            linear_forms
+                .iter()
+                .map(|l| l.as_ref() as &dyn LinearForm<EF>),
+        );
+        assert!(
+            verifier_result.is_err(),
+            "Verifier should reject mismatched polynomial"
+        );
     }
 }

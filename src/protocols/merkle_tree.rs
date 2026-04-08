@@ -276,6 +276,18 @@ impl Witness {
     pub const fn num_nodes(&self) -> usize {
         self.nodes.len()
     }
+
+    /// Returns the Merkle root hash (last node in the tree).
+    pub fn root(&self) -> Hash {
+        self.nodes.last().copied().unwrap_or_default()
+    }
+}
+
+impl Commitment {
+    /// Returns the commitment root hash.
+    pub const fn root(&self) -> Hash {
+        self.hash
+    }
 }
 
 pub const fn layers_for_size(size: usize) -> usize {

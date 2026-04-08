@@ -5,7 +5,7 @@ use ark_std::rand::{distributions::Standard, prelude::Distribution, CryptoRng, R
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
-use super::{Config, Witness};
+use super::{Config, SplitWitness, Witness};
 use crate::{
     algebra::{
         dot,
@@ -304,6 +304,271 @@ where
                     .irs_committer
                     .open(prover_state, &[&old_witness]);
             }
+        }
+
+        // Final sumcheck
+        let final_folding_randomness =
+            self.final_sumcheck
+                .prove(prover_state, &mut vector, &mut covector, &mut the_sum);
+        evaluation_point.extend(final_folding_randomness.0.iter().copied());
+
+        FinalClaim {
+            evaluation_point,
+            rlc_coefficients: initial_forms_rlc_coeffs.to_vec(),
+            linear_form_rlc: M::Target::ZERO,
+        }
+    }
+
+    /// Prove with split witnesses (per-vector commitments).
+    ///
+    /// Like `prove()`, but works with witnesses produced by `commit_split()`.
+    /// Each vector was committed individually; this method RLC-combines them
+    /// and generates a single proof.
+    #[cfg_attr(feature = "tracing", instrument(skip_all))]
+    #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+    pub fn prove_split<H, R>(
+        &self,
+        prover_state: &mut ProverState<H, R>,
+        vectors: Vec<Cow<'_, [M::Source]>>,
+        split_witness: SplitWitness<M::Target, M>,
+        linear_forms: Vec<Box<dyn LinearForm<M::Target>>>,
+        evaluations: Cow<'_, [M::Target]>,
+    ) -> FinalClaim<M::Target>
+    where
+        Standard: Distribution<M::Source> + Distribution<M::Target>,
+        H: DuplexSpongeInterface,
+        R: RngCore + CryptoRng,
+        M::Target: Codec<[H::U]>,
+        [u8; 32]: Decoding<[H::U]>,
+        U64: Codec<[H::U]>,
+        u8: Decoding<[H::U]>,
+        Hash: ProverMessage<[H::U]>,
+    {
+        let num_vectors = vectors.len();
+        let single_config = self.single_vector_committer();
+
+        // Input validation
+        assert_eq!(num_vectors, split_witness.witnesses.len());
+        assert_eq!(evaluations.len(), num_vectors * linear_forms.len());
+        for vector in &vectors {
+            assert_eq!(vector.len(), self.initial_size());
+        }
+        for linear_form in &linear_forms {
+            assert_eq!(linear_form.size(), self.initial_size());
+        }
+        #[cfg(debug_assertions)]
+        for (linear_form, evaluations) in
+            zip_strict(linear_forms.iter(), evaluations.chunks_exact(num_vectors))
+        {
+            use crate::algebra::linear_form::Covector;
+            let covector = Covector::from(&**linear_form);
+            for (vector, evaluation) in zip_strict(&vectors, evaluations) {
+                debug_assert_eq!(covector.evaluate(self.embedding(), vector), *evaluation);
+            }
+        }
+        if vectors.is_empty() {
+            return FinalClaim::default();
+        }
+
+        // Complete evaluations of EVERY vector at EVERY OOD point.
+        // Each split witness covers exactly 1 vector.
+        let (oods_evals, oods_matrix) = {
+            let mut oods_evals = Vec::new();
+            let mut oods_matrix = Vec::new();
+
+            let mut vector_offset = 0;
+            for witness in &split_witness.witnesses {
+                for (oods_eval, oods_row) in zip_strict(
+                    witness.out_of_domain().evaluators(self.initial_size()),
+                    witness.out_of_domain().rows(),
+                ) {
+                    for (j, vector) in vectors.iter().enumerate() {
+                        if j >= vector_offset && j < oods_row.len() + vector_offset {
+                            debug_assert_eq!(
+                                oods_row[j - vector_offset],
+                                oods_eval.evaluate(self.embedding(), vector)
+                            );
+                            oods_matrix.push(oods_row[j - vector_offset]);
+                        } else {
+                            let eval = oods_eval.evaluate(self.embedding(), vector);
+                            prover_state.prover_message(&eval);
+                            oods_matrix.push(eval);
+                        }
+                    }
+                    oods_evals.push(oods_eval);
+                }
+                vector_offset += witness.num_vectors();
+            }
+            (oods_evals, oods_matrix)
+        };
+
+        // Random linear combination of the vectors.
+        let mut vector_rlc_coeffs: Vec<M::Target> = geometric_challenge(prover_state, num_vectors);
+        assert_eq!(vector_rlc_coeffs[0], M::Target::ONE);
+        let mut vectors = vectors.into_iter();
+        let first = vectors.next().expect("non-empty");
+        let mut vector = match first {
+            Cow::Borrowed(slice) => lift(self.embedding(), slice),
+            Cow::Owned(vec) => self.embedding().map_vec(vec),
+        };
+        for (rlc_coeff, input_vector) in zip_strict(&vector_rlc_coeffs[1..], vectors) {
+            mixed_scalar_mul_add(self.embedding(), &mut vector, *rlc_coeff, &input_vector);
+        }
+
+        // Track initial witnesses for opening later.
+        let split_witnesses_owned = split_witness.witnesses;
+        let mut prev_is_split_initial = true;
+
+        // Random linear combination of the constraints.
+        let constraint_rlc_coeffs: Vec<M::Target> =
+            geometric_challenge(prover_state, linear_forms.len() + oods_evals.len());
+        let has_constraints = !constraint_rlc_coeffs.is_empty();
+        let (initial_forms_rlc_coeffs, oods_rlc_coeffs) =
+            constraint_rlc_coeffs.split_at(linear_forms.len());
+        // Try to recycle the first linear form as Covector.
+        let mut covector = vec![];
+        let mut linear_forms = linear_forms;
+        if let Some((first, linear_forms)) = linear_forms.split_first_mut() {
+            debug_assert_eq!(initial_forms_rlc_coeffs[0], M::Target::ONE);
+            if let Some(covector_form) =
+                (first.as_mut() as &mut dyn Any).downcast_mut::<Covector<M::Target>>()
+            {
+                mem::swap(&mut covector, &mut covector_form.vector);
+            } else {
+                covector.resize(self.initial_size(), M::Target::ZERO);
+                first.accumulate(&mut covector, M::Target::ONE);
+            }
+            for (rlc_coeff, linear_form) in zip_strict(&initial_forms_rlc_coeffs[1..], linear_forms)
+            {
+                linear_form.accumulate(&mut covector, *rlc_coeff);
+            }
+        } else if has_constraints {
+            covector.resize(self.initial_size(), M::Target::ZERO);
+        }
+        drop(linear_forms);
+
+        // Compute "The Sum"
+        let mut the_sum: M::Target = zip_strict(
+            initial_forms_rlc_coeffs,
+            evaluations.chunks_exact(num_vectors),
+        )
+        .map(|(poly_coeff, row)| *poly_coeff * dot(&vector_rlc_coeffs, row))
+        .sum();
+        drop(evaluations);
+
+        debug_assert!(!has_constraints || dot(&vector, &covector) == the_sum);
+
+        // Add OODS constraints
+        UnivariateEvaluation::accumulate_many(&oods_evals, &mut covector, oods_rlc_coeffs);
+        the_sum += zip_strict(oods_rlc_coeffs, oods_matrix.chunks_exact(num_vectors))
+            .map(|(poly_coeff, row)| *poly_coeff * dot(&vector_rlc_coeffs, row))
+            .sum::<M::Target>();
+        drop(oods_evals);
+        drop(oods_matrix);
+
+        debug_assert!(!has_constraints || dot(&vector, &covector) == the_sum);
+
+        // Run initial sumcheck on batched vectors with combined statement
+        let mut folding_randomness = if has_constraints {
+            self.initial_sumcheck
+                .prove(prover_state, &mut vector, &mut covector, &mut the_sum)
+        } else {
+            let folding_randomness = (0..self.initial_sumcheck.num_rounds)
+                .map(|_| prover_state.verifier_message())
+                .collect();
+            self.initial_skip_pow.prove(prover_state);
+            for &f in &folding_randomness {
+                fold(&mut vector, f);
+            }
+            covector = vec![M::Target::ZERO; self.initial_sumcheck.final_size()];
+            MultilinearPoint(folding_randomness)
+        };
+        let mut evaluation_point = folding_randomness.0.clone();
+
+        debug_assert_eq!(dot(&vector, &covector), the_sum);
+
+        // Track previous round witness for non-initial rounds.
+        let mut prev_round_witness: Option<irs_commit::Witness<M::Target, M::Target>> = None;
+
+        // Execute standard WHIR rounds on the batched vectors
+        for (round_index, round_config) in self.round_configs.iter().enumerate() {
+            let new_witness = round_config.irs_committer.commit(prover_state, &[&vector]);
+
+            round_config.pow.prove(prover_state);
+
+            // Open the previous round's witness.
+            let in_domain = if prev_is_split_initial {
+                let witness_refs: Vec<&_> = split_witnesses_owned.iter().collect();
+                prev_is_split_initial = false;
+                single_config
+                    .open(prover_state, &witness_refs)
+                    .lift(self.embedding())
+            } else {
+                let old_witness = prev_round_witness
+                    .take()
+                    .expect("non-initial round must have previous witness");
+                let prev_round_config = &self.round_configs[round_index - 1];
+                prev_round_config
+                    .irs_committer
+                    .open(prover_state, &[&old_witness])
+            };
+
+            // Collect constraints for this round and RLC them in
+            let stir_challenges = new_witness
+                .out_of_domain()
+                .evaluators(round_config.initial_size())
+                .chain(in_domain.evaluators(round_config.initial_size()))
+                .collect::<Vec<_>>();
+            let stir_evaluations = new_witness
+                .out_of_domain()
+                .values(&[M::Target::ONE])
+                .chain(in_domain.values(&tensor_product(
+                    &vector_rlc_coeffs,
+                    &folding_randomness.eq_weights(),
+                )))
+                .collect::<Vec<_>>();
+            let stir_rlc_coeffs = geometric_challenge(prover_state, stir_challenges.len());
+            UnivariateEvaluation::accumulate_many(
+                &stir_challenges,
+                &mut covector,
+                &stir_rlc_coeffs,
+            );
+            the_sum += dot(&stir_rlc_coeffs, &stir_evaluations);
+            debug_assert_eq!(dot(&vector, &covector), the_sum);
+
+            folding_randomness =
+                round_config
+                    .sumcheck
+                    .prove(prover_state, &mut vector, &mut covector, &mut the_sum);
+
+            evaluation_point.extend(folding_randomness.0.iter().copied());
+            debug_assert_eq!(dot(&vector, &covector), the_sum);
+
+            prev_round_witness = Some(new_witness);
+            vector_rlc_coeffs = vec![M::Target::ONE];
+        }
+
+        // Directly send the vector to the verifier.
+        assert_eq!(vector.len(), self.final_sumcheck.initial_size);
+        for coeff in &vector {
+            prover_state.prover_message(coeff);
+        }
+
+        // PoW
+        self.final_pow.prove(prover_state);
+
+        // Open and consume the final previous witness.
+        if prev_is_split_initial {
+            let witness_refs: Vec<&_> = split_witnesses_owned.iter().collect();
+            let _in_domain = single_config.open(prover_state, &witness_refs);
+        } else {
+            let old_witness = prev_round_witness
+                .take()
+                .expect("must have previous witness");
+            let prev_config = self.round_configs.last().unwrap();
+            let _in_domain = prev_config
+                .irs_committer
+                .open(prover_state, &[&old_witness]);
         }
 
         // Final sumcheck

@@ -68,6 +68,24 @@ where
     pub roots: Vec<Hash>,
 }
 
+impl<F: FftField, M: Embedding<Target = F>> SplitWitness<F, M>
+where
+    M::Source: FftField,
+{
+    /// Construct a `SplitWitness` from individually collected per-vector results.
+    ///
+    /// Use this with [`Config::commit_single`] for phased commit workflows
+    /// where vectors are committed at different times (e.g., some vectors
+    /// depend on challenges derived from earlier commitment roots).
+    pub fn new(
+        witnesses: Vec<irs_commit::Witness<M::Source, F>>,
+        roots: Vec<Hash>,
+    ) -> Self {
+        assert_eq!(witnesses.len(), roots.len());
+        Self { witnesses, roots }
+    }
+}
+
 #[must_use = "The final claim must be checked if there where any linear forms."]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FinalClaim<F: Field> {
@@ -152,11 +170,47 @@ where
         }
     }
 
+    /// Commit a single vector to the WHIR session.
+    ///
+    /// This is one iteration of what [`commit_split`](Self::commit_split) does
+    /// internally. Use it when you need to interleave external operations
+    /// (e.g., derive challenges from Merkle roots) between per-vector commits.
+    ///
+    /// Internally:
+    ///   1. Build Merkle tree from evaluations (using `num_vectors=1` config)
+    ///   2. Absorb root into `prover_state`
+    ///   3. Squeeze OOD challenge points
+    ///   4. Compute OOD evaluations
+    ///   5. Absorb OOD evaluations
+    ///
+    /// Returns `(witness, merkle_root)`. Collect these across calls and pass
+    /// to [`prove_split`](Self::prove_split) via [`SplitWitness::new`].
+    pub fn commit_single<H, R>(
+        &self,
+        prover_state: &mut ProverState<H, R>,
+        evals: &[M::Source],
+    ) -> (Witness<M::Target, M>, Hash)
+    where
+        Standard: Distribution<M::Source>,
+        H: DuplexSpongeInterface,
+        R: RngCore + CryptoRng,
+        M::Target: Codec<[H::U]>,
+        Hash: ProverMessage<[H::U]>,
+    {
+        let single_config = self.single_vector_committer();
+        let witness = single_config.commit(prover_state, &[evals]);
+        let root = witness.matrix_witness.root();
+        (witness, root)
+    }
+
     /// Commit to each vector individually, returning per-vector roots.
     ///
     /// Unlike `commit()` which interleaves all vectors into one matrix,
     /// this commits each vector separately using `num_vectors=1`. This
     /// allows extracting individual commitment roots (e.g., for VK binding).
+    ///
+    /// Equivalent to calling [`commit_single`](Self::commit_single) for each
+    /// vector and collecting the results into a [`SplitWitness`].
     ///
     /// The WHIR `prove_split()` step will RLC-combine the separate commitments.
     #[cfg_attr(feature = "tracing", instrument(skip_all, fields(num_vectors = vectors.len())))]
@@ -172,13 +226,12 @@ where
         M::Target: Codec<[H::U]>,
         Hash: ProverMessage<[H::U]>,
     {
-        let single_config = self.single_vector_committer();
         let mut witnesses = Vec::with_capacity(vectors.len());
         let mut roots = Vec::with_capacity(vectors.len());
         for &vector in vectors {
-            let witness = single_config.commit(prover_state, &[vector]);
-            roots.push(witness.matrix_witness.root());
+            let (witness, root) = self.commit_single(prover_state, vector);
             witnesses.push(witness);
+            roots.push(root);
         }
         SplitWitness { witnesses, roots }
     }
@@ -1247,5 +1300,146 @@ mod tests {
             verifier_result.is_err(),
             "Verifier should reject mismatched polynomial"
         );
+    }
+
+    // ---- Phased split-commit tests ----
+
+    /// Test that `commit_single` + `SplitWitness::new` produces identical
+    /// transcript and proof bytes as `commit_split`.
+    fn make_whir_split_phased_things(
+        num_variables: usize,
+        initial_folding_factor: usize,
+        folding_factor: usize,
+        num_points_per_poly: usize,
+        num_vectors: usize,
+        unique_decoding: bool,
+    ) {
+        let num_coeffs = 1 << num_variables;
+        let mut rng = ark_std::test_rng();
+
+        let whir_params = ProtocolParameters {
+            security_level: 32,
+            pow_bits: 0,
+            initial_folding_factor,
+            folding_factor,
+            unique_decoding,
+            starting_log_inv_rate: 1,
+            batch_size: 1,
+            hash_id: hash::SHA2,
+        };
+
+        let mut params = Config::<Basefield<EF>>::new(1 << num_variables, &whir_params);
+        params.disable_pow();
+
+        let vectors: Vec<Vec<F>> = (0..num_vectors)
+            .map(|i| vec![F::from((i + 1) as u64); num_coeffs])
+            .collect();
+        let vec_refs = vectors.iter().map(|v| v.as_slice()).collect::<Vec<_>>();
+
+        let points: Vec<_> = (0..num_points_per_poly)
+            .map(|_| MultilinearPoint::rand(&mut rng, num_variables))
+            .collect();
+
+        let mut linear_forms: Vec<Box<dyn Evaluate<Basefield<EF>>>> = Vec::new();
+        for point in &points {
+            linear_forms.push(Box::new(MultilinearExtension {
+                point: point.0.clone(),
+            }));
+        }
+        linear_forms.push(Box::new(Covector {
+            vector: (0..1 << num_variables).map(EF::from).collect(),
+        }));
+
+        let evaluations = linear_forms
+            .iter()
+            .flat_map(|linear_form| {
+                vec_refs
+                    .iter()
+                    .map(|vec| linear_form.evaluate(params.embedding(), vec))
+            })
+            .collect::<Vec<_>>();
+
+        // ---- Path A: commit_split (reference) ----
+        let ds = DomainSeparator::protocol(&params)
+            .session(&format!("Test at {}:{}", file!(), line!()))
+            .instance(&Empty);
+        let mut prover_state_a = ProverState::new_std(&ds);
+        let split_witness_a = params.commit_split(&mut prover_state_a, &vec_refs);
+        let _ = params.prove_split(
+            &mut prover_state_a,
+            vectors.iter().map(|v| Cow::Borrowed(v.as_slice())).collect(),
+            split_witness_a,
+            build_prove_forms(&points, num_variables, true),
+            Cow::Borrowed(evaluations.as_slice()),
+        );
+        let proof_a = prover_state_a.proof();
+
+        // ---- Path B: commit_single × N (phased) ----
+        let mut prover_state_b = ProverState::new_std(&ds);
+        let mut witnesses = Vec::with_capacity(num_vectors);
+        let mut roots = Vec::with_capacity(num_vectors);
+        for &vector in &vec_refs {
+            let (witness, root) = params.commit_single(&mut prover_state_b, vector);
+            witnesses.push(witness);
+            roots.push(root);
+        }
+        let split_witness_b = SplitWitness::new(witnesses, roots);
+        let _ = params.prove_split(
+            &mut prover_state_b,
+            vectors.iter().map(|v| Cow::Borrowed(v.as_slice())).collect(),
+            split_witness_b,
+            build_prove_forms(&points, num_variables, true),
+            Cow::Borrowed(evaluations.as_slice()),
+        );
+        let proof_b = prover_state_b.proof();
+
+        // Transcript equivalence: identical proof bytes
+        assert_eq!(proof_a, proof_b, "Phased commit must produce identical proof");
+
+        // Verify phased proof
+        let mut verifier_state = VerifierState::new_std(&ds, &proof_b);
+        let commitments = params
+            .receive_split_commitment(&mut verifier_state, num_vectors)
+            .unwrap();
+        let commitment_refs = commitments.iter().collect::<Vec<_>>();
+        let final_claim = params
+            .verify_split(&mut verifier_state, &commitment_refs, &evaluations)
+            .unwrap();
+        final_claim
+            .verify(
+                linear_forms
+                    .iter()
+                    .map(|l| l.as_ref() as &dyn LinearForm<EF>),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_whir_split_phased() {
+        let folding_factors = [2, 3];
+        let num_vectors_list = [1, 2, 3];
+        let num_points = [0, 1, 2];
+
+        for folding_factor in folding_factors {
+            for num_variables in (2 * folding_factor)..=(3 * folding_factor) {
+                for num_vecs in num_vectors_list {
+                    for num_pts in num_points {
+                        make_whir_split_phased_things(
+                            num_variables,
+                            folding_factor,
+                            folding_factor,
+                            num_pts,
+                            num_vecs,
+                            false,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_whir_split_phased_unique_decoding() {
+        make_whir_split_phased_things(6, 2, 2, 1, 2, true);
     }
 }
